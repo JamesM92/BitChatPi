@@ -15,6 +15,8 @@ from __future__ import annotations
 import logging
 from typing import Callable, Optional, TYPE_CHECKING
 
+import asyncio
+
 from dbus_fast.aio import MessageBus
 from dbus_fast import BusType, Variant
 from dbus_fast.service import ServiceInterface, method as dbus_method
@@ -60,7 +62,6 @@ class _GattApplication(ServiceInterface):
                     "Flags":   Variant("as", [
                         "read",
                         "write",
-                        "write-without-response",
                         "notify",
                     ]),
                 }
@@ -92,13 +93,15 @@ class _GattCharacteristic(ServiceInterface):
     Call notify(data) to push a value to subscribed centrals.
     """
 
-    def __init__(self, uuid: str, service_path: str, on_write: WriteCallback) -> None:
+    def __init__(self, uuid: str, service_path: str, on_write: WriteCallback,
+                 on_start_notify: "Optional[Callable[[], None]]" = None) -> None:
         super().__init__("org.bluez.GattCharacteristic1")
         self._uuid     = uuid
         self._svc_path = service_path
         self._value    = bytes()
         self._notifying: bool = False
         self._on_write = on_write
+        self._on_start_notify = on_start_notify
         self.connected_device_paths: set[str] = set()  # D-Bus paths seen via WriteValue
 
     # ── D-Bus properties ──────────────────────────────────────────────────────
@@ -113,7 +116,7 @@ class _GattCharacteristic(ServiceInterface):
 
     @dbus_property(access=PropertyAccess.READ)
     def Flags(self) -> "as":
-        return ["read", "write", "write-without-response", "notify"]
+        return ["read", "write", "notify"]
 
     @dbus_property(access=PropertyAccess.READ)
     def Notifying(self) -> "b":
@@ -148,6 +151,11 @@ class _GattCharacteristic(ServiceInterface):
     def StartNotify(self):
         self._notifying = True
         log.info("StartNotify — central subscribed to notifications")
+        if self._on_start_notify is not None:
+            try:
+                self._on_start_notify()
+            except Exception:
+                log.exception("on_start_notify raised")
 
     @dbus_method()
     def StopNotify(self):
@@ -175,17 +183,18 @@ class GattServer:
 
     async def start(
         self,
-        service_uuid:  str,
-        char_uuid:     str,
-        on_write:      WriteCallback,
-        adapter_path:  str = _ADAPTER_OBJ,
+        service_uuid:    str,
+        char_uuid:       str,
+        on_write:        WriteCallback,
+        on_start_notify: "Optional[Callable[[], None]]" = None,
+        adapter_path:    str = _ADAPTER_OBJ,
     ) -> None:
         bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
         self._bus = bus
 
         app  = _GattApplication(service_uuid, char_uuid)
         svc  = _GattService(service_uuid)
-        char = _GattCharacteristic(char_uuid, _SVC_PATH, on_write)
+        char = _GattCharacteristic(char_uuid, _SVC_PATH, on_write, on_start_notify)
         self._char = char
 
         bus.export(_APP_PATH,  app)
@@ -195,8 +204,22 @@ class GattServer:
         intro = await bus.introspect(_BLUEZ_BUS, adapter_path)
         proxy = bus.get_proxy_object(_BLUEZ_BUS, adapter_path, intro)
         mgr   = proxy.get_interface(_GATT_MGR_IF)
-        await mgr.call_register_application(_APP_PATH, {})
-        log.info("GATT application registered  service=%s  char=%s", service_uuid, char_uuid)
+
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                await mgr.call_register_application(_APP_PATH, {})
+                log.info("GATT application registered  service=%s  char=%s",
+                         service_uuid, char_uuid)
+                return
+            except Exception as exc:
+                last_exc = exc
+                log.warning("GATT registration failed (attempt %d/3): %s — retrying in 2 s",
+                            attempt + 1, exc)
+                await asyncio.sleep(2)
+
+        bus.disconnect()
+        raise RuntimeError(f"Could not register GATT application after 3 attempts: {last_exc}")
 
     def send(self, data: bytes) -> None:
         """Push raw bytes to subscribed centrals."""
@@ -211,6 +234,23 @@ class GattServer:
         if self._char is None:
             return set()
         return self._char.connected_device_paths
+
+    @property
+    def connected_addresses(self) -> set[str]:
+        """MAC addresses (AA:BB:CC:DD:EE:FF) derived from connected_device_paths."""
+        result: set[str] = set()
+        for path in self.connected_device_paths:
+            parts = path.rsplit("/dev_", 1)
+            if len(parts) == 2:
+                result.add(parts[1].replace("_", ":").upper())
+        return result
+
+    def remove_device(self, address: str) -> None:
+        """Remove a device from tracked paths when it disconnects (address like AA:BB:CC:DD:EE:FF)."""
+        if self._char is None:
+            return
+        path = "/org/bluez/hci0/dev_" + address.upper().replace(":", "_")
+        self._char.connected_device_paths.discard(path)
 
     async def stop(self, adapter_path: str = _ADAPTER_OBJ) -> None:
         if self._bus is None:

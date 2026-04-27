@@ -7,6 +7,7 @@ Key lessons from btmon debugging:
   - Type must be "peripheral" for connectable ADV_IND advertising.
 """
 from __future__ import annotations
+import asyncio
 import logging
 
 from dbus_fast.aio import MessageBus
@@ -84,9 +85,23 @@ async def start_le_advertisement(
     proxy = bus.get_proxy_object(_BLUEZ_BUS, adapter_path, intro)
     mgr   = proxy.get_interface(_ADV_MGR)
 
-    await mgr.call_register_advertisement(_ADV_PATH, {})
-    log.info("LE advertisement registered: name=%s  service=%s", local_name, service_uuid)
-    return bus
+    # Retry up to 3 times as a safety net for transient BlueZ delays.
+    # Persistent slot conflicts are cleared by the adapter power cycle in daemon.py.
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            await mgr.call_register_advertisement(_ADV_PATH, {})
+            log.info("LE advertisement registered: name=%s  service=%s",
+                     local_name, service_uuid)
+            return bus
+        except Exception as exc:
+            last_exc = exc
+            log.warning("Advertisement registration failed (attempt %d/3): %s — retrying in 2 s",
+                        attempt + 1, exc)
+            await asyncio.sleep(2)
+
+    bus.disconnect()
+    raise RuntimeError(f"Could not register advertisement after 3 attempts: {last_exc}")
 
 
 async def stop_le_advertisement(bus: "MessageBus", adapter_path: str = _ADAPTER_OBJ) -> None:

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from bitchatd.crypto.identity import generate, load_or_create, _peer_id_from_noise_pub
+from bitchatd.crypto.identity import generate, load_or_create, _peer_id_from_sign_pub
 from bitchatd.crypto.signing import sign, verify
 from bitchatd.crypto.noise_session import NoiseSession, SessionState
 
@@ -19,9 +19,9 @@ def test_generate_produces_8_byte_peer_id():
     assert len(ident.peer_id) == 8
 
 
-def test_peer_id_derived_from_noise_public():
+def test_peer_id_derived_from_sign_public():
     ident = generate()
-    expected = _peer_id_from_noise_pub(ident.noise_keypair.public.data)
+    expected = _peer_id_from_sign_pub(ident.sign_public)
     assert ident.peer_id == expected
 
 
@@ -30,9 +30,10 @@ def test_save_and_load_round_trip():
         path = Path(d) / "identity.json"
         ident = load_or_create(path)
         loaded = load_or_create(path)
+        # peer_id and signing key are stable; noise keypair is regenerated each load
         assert ident.peer_id == loaded.peer_id
-        assert ident.noise_keypair.public.data == loaded.noise_keypair.public.data
         assert ident.sign_public == loaded.sign_public
+        assert ident.noise_keypair.public.data != loaded.noise_keypair.public.data
 
 
 def test_load_or_create_is_idempotent():
@@ -48,8 +49,11 @@ def test_identity_json_has_expected_keys():
         path = Path(d) / "identity.json"
         load_or_create(path)
         data = json.loads(path.read_text())
-        for key in ("noise_private", "noise_public", "sign_private", "sign_public", "peer_id"):
+        # noise keypair is never persisted — regenerated fresh each run
+        for key in ("sign_private", "sign_public", "peer_id"):
             assert key in data
+        assert "noise_private" not in data
+        assert "noise_public" not in data
 
 
 # ── Ed25519 signing ────────────────────────────────────────────────────────────

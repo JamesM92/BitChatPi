@@ -5,12 +5,15 @@
 # ──────────────────────────────────────────────────────────────────────────────
 from __future__ import annotations
 import asyncio
+import logging
 import os
 import struct
 import time
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import Optional, Callable, Awaitable
+
+log = logging.getLogger(__name__)
 
 from ..protocol.packet import BitchatPacket
 from ..protocol.codec import encode, decode, _unpad
@@ -83,7 +86,7 @@ class FragmentManager:
 
     def start(self) -> None:
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             self._cleanup_task = loop.create_task(self._cleanup_loop())
         except RuntimeError:
             pass
@@ -91,6 +94,12 @@ class FragmentManager:
     def stop(self) -> None:
         if self._cleanup_task:
             self._cleanup_task.cancel()
+
+    def is_receiving(self) -> bool:
+        return bool(self._sets)
+
+    def is_new_set(self, frag_id: bytes) -> bool:
+        return frag_id.hex() not in self._sets
 
     # ── Outbound ───────────────────────────────────────────────────────────────
 
@@ -190,6 +199,8 @@ class FragmentManager:
                     total=total,
                     timestamp_ms=time.time() * 1000,
                 )
+                log.info("FRAGMENT new set from %s  id=%s  total=%d  orig_type=0x%02x",
+                         packet.sender_id.hex(), frag_key[:8], total, original_type)
 
             s = self._sets[frag_key]
 
@@ -241,4 +252,7 @@ class FragmentManager:
         with self._lock:
             expired = [k for k, s in self._sets.items() if s.timestamp_ms < cutoff]
             for k in expired:
+                s = self._sets[k]
+                log.warning("FRAGMENT set expired  id=%s  received=%d/%d  orig_type=0x%02x",
+                            k[:8], len(s.fragments), s.total, s.original_type)
                 self._remove_set(k)

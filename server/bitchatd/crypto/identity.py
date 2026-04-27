@@ -1,8 +1,15 @@
 """
 Local identity: static Curve25519 keypair (for Noise XX) + Ed25519 signing keypair.
 
-peerID = first 8 bytes of SHA-256(static_x25519_public_key), stored as raw bytes.
-Persisted to ~/.config/bitchatd/identity.json as hex strings.
+peerID = first 8 bytes of SHA-256(ed25519_sign_public_key).
+This makes the peer ID stable across restarts even though the Noise keypair
+is regenerated on every startup.
+
+Regenerating the Noise keypair each restart causes phones to see a changed
+noise_pub for the same peer_id and automatically re-initiate the Noise XX
+handshake, recovering from Pi restarts without any manual phone reset.
+
+Persisted to ~/.config/bitchatd/identity.json (signing keypair only).
 """
 from __future__ import annotations
 import hashlib
@@ -28,21 +35,21 @@ _DEFAULT_PATH = Path.home() / ".config" / "bitchatd" / "identity.json"
 
 @dataclass
 class Identity:
-    noise_keypair: X25519KeyPair   # Curve25519 static key for Noise XX
+    noise_keypair: X25519KeyPair   # Curve25519 static key for Noise XX — fresh each run
     sign_private: Ed25519PrivateKey
     sign_public: bytes             # 32-byte Ed25519 public key (raw)
-    peer_id: bytes                 # 8-byte peer identifier
+    peer_id: bytes                 # 8-byte peer identifier — derived from sign_public
 
 
-def _peer_id_from_noise_pub(pub_bytes: bytes) -> bytes:
-    return hashlib.sha256(pub_bytes).digest()[:8]
+def _peer_id_from_sign_pub(sign_pub: bytes) -> bytes:
+    return hashlib.sha256(sign_pub).digest()[:8]
 
 
 def generate() -> Identity:
     noise_kp = _DH.generate_keypair()
     sign_key = Ed25519PrivateKey.generate()
     sign_pub = sign_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    peer_id = _peer_id_from_noise_pub(noise_kp.public.data)
+    peer_id = _peer_id_from_sign_pub(sign_pub)
     return Identity(
         noise_keypair=noise_kp,
         sign_private=sign_key,
@@ -69,28 +76,25 @@ def _save(identity: Identity, path: Path) -> None:
         Encoding.Raw, PrivateFormat.Raw, NoEncryption()
     )
     data = {
-        "noise_private": identity.noise_keypair.private.data.hex(),
-        "noise_public":  identity.noise_keypair.public.data.hex(),
-        "sign_private":  priv_bytes.hex(),
-        "sign_public":   identity.sign_public.hex(),
-        "peer_id":       identity.peer_id.hex(),
+        "sign_private": priv_bytes.hex(),
+        "sign_public":  identity.sign_public.hex(),
+        "peer_id":      identity.peer_id.hex(),
     }
     path.write_text(json.dumps(data, indent=2))
 
 
 def _load(path: Path) -> Identity:
-    from dissononce.dh.x25519.private import PrivateKey as X25519Private
-    from dissononce.dh.x25519.public import PublicKey as X25519Public
-
     data = json.loads(path.read_text())
-    noise_priv = X25519Private(bytes.fromhex(data["noise_private"]))
-    noise_pub  = X25519Public(bytes.fromhex(data["noise_public"]))
-    noise_kp   = X25519KeyPair(noise_pub, noise_priv)
 
     sign_priv_bytes = bytes.fromhex(data["sign_private"])
-    sign_key  = Ed25519PrivateKey.from_private_bytes(sign_priv_bytes)
-    sign_pub  = bytes.fromhex(data["sign_public"])
-    peer_id   = bytes.fromhex(data["peer_id"])
+    sign_key = Ed25519PrivateKey.from_private_bytes(sign_priv_bytes)
+    sign_pub = sign_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+    # Noise keypair is always fresh — never persisted
+    noise_kp = _DH.generate_keypair()
+
+    # peer_id is stable: SHA-256(sign_public)[:8]
+    peer_id = _peer_id_from_sign_pub(sign_pub)
 
     return Identity(
         noise_keypair=noise_kp,

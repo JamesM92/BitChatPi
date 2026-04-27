@@ -263,12 +263,12 @@ class App:
 
     def _preview_file(self, path: str) -> None:
         """On Enter/click: render image as ASCII art, or show the saved path."""
-        mime = ""
-        try:
-            import mimetypes
-            mime = mimetypes.guess_type(path)[0] or ""
-        except Exception:
-            pass
+        if not os.path.exists(path):
+            self._add_sys(self.active, f"File not found: {path}")
+            self.loop.draw_screen()
+            return
+        import mimetypes
+        mime = mimetypes.guess_type(path)[0] or ""
         if mime.startswith("image/"):
             self._render_image(self.active, path)
         else:
@@ -311,14 +311,24 @@ class App:
             from PIL import Image
             from pathlib import Path as _Path
             import sys as _sys
-            _sys.path.insert(0, str(_Path(__file__).parent))
+            client_dir = str(_Path(__file__).resolve().parent)
+            if client_dir not in _sys.path:
+                _sys.path.insert(0, client_dir)
             from img2ascii import to_ascii
             img = Image.open(path)
-            art = to_ascii(img, width=55, invert=False)
+            # Derive available width from the current terminal size.
+            # Layout: full_cols - peer_panel - 1 (divider) - prefix_chars
+            # prefix: "[HH:MM]    " = about 12 chars; leave a 2-char margin.
+            try:
+                cols, _ = self.loop.screen.get_cols_rows()
+            except Exception:
+                cols = 80
+            img_width = max(20, cols - PEER_PANEL_W - 1 - 14)
+            art = to_ascii(img, width=img_width, invert=False)
             for line in art.split("\n"):
                 self._add_msg(key, "   ", line, "chat_other")
-        except Exception:
-            pass  # image display is best-effort
+        except Exception as exc:
+            self._add_sys(key, f"Image preview failed: {exc}")
 
     # ── Input handling ────────────────────────────────────────────────────────
 
@@ -326,6 +336,16 @@ class App:
         if key == "enter":
             if self.frame.focus_position == "footer":
                 self._send_input()
+        elif key == "tab":
+            # Toggle: footer ↔ chat panel (so Enter on a file row works)
+            try:
+                if self.frame.focus_position == "footer":
+                    self.frame.focus_position = "body"
+                    self.frame.body.focus_position = 2  # chat column
+                else:
+                    self.frame.focus_position = "footer"
+            except Exception:
+                self.frame.focus_position = "footer"
         elif key in ("ctrl c", "ctrl q"):
             raise urwid.ExitMainLoop()
 
@@ -345,8 +365,9 @@ class App:
                 self._add_sys(self.active, f"Not found: {path}")
                 return
             self.ipc_q.put({"cmd": "send_file", "to": self.active, "path": path})
-            name = os.path.basename(path)
             self._add_msg(self.active, "me", f"{_FILE_TAG}{path}", "chat_self")
+            idx = len(self.chats[self.active]) - 1
+            self._ack_pending.append((self.active, idx))
             return
 
         if self.active == GLOBAL_KEY:
@@ -380,8 +401,11 @@ class App:
                 self.connected = False
                 self.header_text.set_text(" BitChatPi  [disconnected]")
             elif kind == "ipc":
-                changed = self._handle_ipc_event(payload)
-                peers_changed = peers_changed or changed
+                try:
+                    changed = self._handle_ipc_event(payload)
+                    peers_changed = peers_changed or changed
+                except Exception as exc:
+                    self._add_sys(GLOBAL_KEY, f"[TUI error] {exc}")
 
         if peers_changed:
             self._rebuild_peer_list()
@@ -429,10 +453,11 @@ class App:
                 if is_new:
                     self.peers[from_id] = nick
                 self._add_msg(from_id, nick, content, "chat_other")
-                return is_new
+                # Rebuild if new peer, or message landed in unread (not active chat)
+                return is_new or from_id != self.active
             else:
                 self._add_msg(GLOBAL_KEY, nick, content, "chat_other")
-            return False
+                return GLOBAL_KEY != self.active
 
         if ev == "receipt":
             rtype = obj.get("type", "")
@@ -448,15 +473,19 @@ class App:
                 peer_key, idx = loc
                 if 0 <= idx < len(self.chats[peer_key]):
                     ts, lbl, txt, attr = self.chats[peer_key][idx]
-                    # Strip any tick already appended before upgrading ✓ → ✓✓
-                    for suffix in ("  ✓✓", "  ✓"):
-                        if txt.endswith(suffix):
-                            txt = txt[: -len(suffix)]
-                            break
-                    self.chats[peer_key][idx] = (ts, lbl, txt + f"  {sym}", attr)
-                    if peer_key == self.active and idx < len(self.chat_walker):
-                        self.chat_walker[idx] = self._make_chat_row(
-                            self.chats[peer_key][idx])
+                    if txt.startswith(_FILE_TAG):
+                        # Never mutate the file path — ticks on file rows are skipped
+                        pass
+                    else:
+                        # Strip any tick already appended before upgrading ✓ → ✓✓
+                        for suffix in ("  ✓✓", "  ✓"):
+                            if txt.endswith(suffix):
+                                txt = txt[: -len(suffix)]
+                                break
+                        self.chats[peer_key][idx] = (ts, lbl, txt + f"  {sym}", attr)
+                        if peer_key == self.active and idx < len(self.chat_walker):
+                            self.chat_walker[idx] = self._make_chat_row(
+                                self.chats[peer_key][idx])
             # else: receipt for an auto-sent or untracked message — ignore silently
             return False
 
@@ -465,16 +494,16 @@ class App:
             nick    = obj.get("nick") or (from_id[:8] if from_id else "?")
             path    = obj.get("path", "")
             mime    = obj.get("mime", "")
+            name    = obj.get("name", os.path.basename(path) if path else "file")
             target  = from_id if from_id else GLOBAL_KEY
             is_new  = from_id and from_id not in self.peers
             if from_id:
                 self.peers[from_id] = nick
-            # Clickable file row
-            self._add_msg(target, nick, f"{_FILE_TAG}{path}", "chat_system")
-            # For images, also render inline ASCII art preview
-            if mime.startswith("image/") and path:
-                self._render_image(target, path)
-            return bool(is_new)
+            self._add_sys(target, f"File received: {name}  [{mime}]  saved: {path}")
+            # Clickable preview row only for images (audio/video can't be played in the TUI)
+            if mime.startswith("image/"):
+                self._add_msg(target, nick, f"{_FILE_TAG}{path}", "chat_system")
+            return bool(is_new) or target != self.active
 
         # {"ok": true, "msg_id": "..."} — assign UUID to pending sent message
         if obj.get("ok") and "msg_id" in obj:
