@@ -3,11 +3,13 @@
 BitChatPi daemon — Pi acts as a full BitChat mesh node (peripheral + central).
 
 IPC API (Unix socket, newline-delimited JSON):
-  Send commands:  {"cmd":"send","to":"<peer_id_hex>","content":"..."}
+  Send commands:  {"cmd":"ping"}
+                  {"cmd":"set_nick","nick":"NodeBot"}
+                  {"cmd":"send","to":"<peer_id_hex>","content":"..."}
                   {"cmd":"broadcast","content":"..."}
                   {"cmd":"send_file","to":"<peer_id_hex>","path":"..."}
                   {"cmd":"peers"}
-  Receive events: {"event":"message","from":"...","nick":"...","content":"...","private":true}
+  Receive events: {"event":"message","from":"...","nick":"...","content":"...","private":true,"self":false}
                   {"event":"peer","action":"seen"|"lost","peer_id":"...","nick":"..."}
                   {"event":"receipt","type":"delivery"|"read","ref":"...","from":"..."}
                   {"event":"file","from":"...","nick":"...","path":"...","mime":"...","name":"..."}
@@ -18,6 +20,8 @@ Usage:
 import asyncio
 import logging
 import sys
+import time
+from collections import OrderedDict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -44,8 +48,8 @@ logging.basicConfig(
 logging.getLogger("dissononce").setLevel(logging.WARNING)
 log = logging.getLogger("smoke")
 
-IDENTITY_PATH = Path.home() / ".config" / "bitchatd" / "identity.json"
-IPC_SOCK_PATH = str(Path.home() / ".config" / "bitchatd" / "api.sock")
+IDENTITY_PATH    = Path.home() / ".config" / "bitchatd" / "identity.json"
+DEFAULT_SOCK_PATH = str(Path.home() / ".config" / "bitchatd" / "api.sock")
 
 _gatt:        GattServer    | None = None
 _scanner:     BleScanner    | None = None
@@ -54,6 +58,41 @@ _relay:       RelayEngine   | None = None
 _fragments:   FragmentManager | None = None
 _session_mgr: SessionManager  | None = None
 _identity     = None  # set in run()
+
+# Dedup cache: packets arrive via both the peripheral (WriteValue) and central
+# (scanner notification) BLE paths simultaneously.  Without this, every packet
+# is processed twice — public messages are published twice to the IPC and
+# duplicate Noise handshake messages can corrupt established sessions.
+# FRAGMENT packets are exempt: the FragmentManager is already idempotent.
+_seen_dispatch: OrderedDict[bytes, int] = OrderedDict()
+_DISPATCH_DEDUP_MS  = 10_000   # drop exact duplicate within this window (ms)
+_DISPATCH_DEDUP_MAX = 1_000    # LRU cap
+
+
+def _dispatch_dedup_key(pkt: "BitchatPacket") -> bytes:
+    # Encrypted packets share a timestamp when sent in rapid succession
+    # (e.g. Android sends delivery+read receipts back-to-back).  Use the
+    # actual ciphertext as the key so those two distinct packets get distinct
+    # keys while true duplicates (same bytes via two BLE paths) still match.
+    if pkt.type in (MessageType.NOISE_ENCRYPTED, MessageType.NOISE_HANDSHAKE):
+        return pkt.sender_id + pkt.type.to_bytes(1, "big") + pkt.payload
+    return pkt.sender_id + pkt.type.to_bytes(1, "big") + pkt.timestamp.to_bytes(8, "big")
+
+
+def _is_dispatch_duplicate(pkt: "BitchatPacket") -> bool:
+    if pkt.type == MessageType.FRAGMENT:
+        return False
+    key = _dispatch_dedup_key(pkt)
+    now = int(time.time() * 1000)
+    if key in _seen_dispatch:
+        if now - _seen_dispatch[key] < _DISPATCH_DEDUP_MS:
+            return True
+        del _seen_dispatch[key]
+    _seen_dispatch[key] = now
+    _seen_dispatch.move_to_end(key)
+    while len(_seen_dispatch) > _DISPATCH_DEDUP_MAX:
+        _seen_dispatch.popitem(last=False)
+    return False
 
 
 # ── IPC fan-out ────────────────────────────────────────────────────────────────
@@ -73,8 +112,18 @@ def _send_packet(pkt: BitchatPacket) -> None:
     if _gatt is None:
         log.warning("GATT server not ready")
         return
+
+    # Always send via the peripheral (GATT notification) path — this is how phones
+    # receive Pi's ANNOUNCEs and how session handshakes complete.  Suppressing this
+    # path was preventing newly-connecting phones from receiving Pi's ANNOUNCE,
+    # which meant they never added Pi to their peer list.
     _gatt.send(raw)
-    if _scanner is not None and _scanner.connected_count > 0:
+
+    # Suppress scanner (central-role) sends during fragment reassembly.  The central
+    # connection is already released by disconnect_all_central() on the first fragment,
+    # so connected_count is usually 0 here; the guard is belt-and-suspenders.
+    receiving = _fragments is not None and _fragments.is_receiving()
+    if _scanner is not None and _scanner.connected_count > 0 and not receiving:
         asyncio.ensure_future(_scanner.send(raw))
     log.info("SENT type=0x%02x  %d bytes", pkt.type, len(raw))
 
@@ -115,7 +164,16 @@ def _dispatch(pkt: BitchatPacket) -> None:
     if _identity and pkt.sender_id == _identity.peer_id:
         return
 
+    if _is_dispatch_duplicate(pkt):
+        log.debug("DROP dup  type=0x%02x  from=%s  ts=%d",
+                  pkt.type, pkt.sender_id.hex()[:8], pkt.timestamp)
+        return
+
     peer_hex = pkt.sender_id.hex()
+    log.info("RECV type=0x%02x  ttl=%d  from=%s  recip=%s  %d bytes",
+             pkt.type, pkt.ttl, peer_hex[:8],
+             pkt.recipient_id.hex() if pkt.recipient_id else "broadcast",
+             len(pkt.payload))
 
     if pkt.type == MessageType.FRAGMENT:
         if _fragments is not None:
@@ -124,6 +182,17 @@ def _dispatch(pkt: BitchatPacket) -> None:
                 _fid, _idx, _tot, _otype, _data = decoded
                 log.debug("FRAGMENT from %s  [%d/%d]  orig_type=0x%02x  %d bytes",
                           peer_hex, _idx + 1, _tot, _otype, len(_data))
+                # On the first fragment of a large new set, release all central
+                # connections before handle_fragment creates the set entry.
+                # Fragments arrive via scanner notifications (device_path=None) AND
+                # via WriteValue (device_path set) — check path-agnostically here.
+                # Two simultaneous BLE connections (central + peripheral) to the same
+                # physical phone cause radio scheduling conflicts that drop peripheral
+                # writes after ~25 fragments (~3 s into the transfer, when Android
+                # renegotiates connection parameters).  Releasing the central connection
+                # eliminates the conflict; scanner reconnects after the transfer.
+                if _scanner and _tot >= 20 and _fragments.is_new_set(_fid):
+                    _scanner.disconnect_all_central()
             reassembled = _fragments.handle_fragment(pkt)
             if reassembled is not None:
                 log.info("FRAGMENT reassembled from %s  original_type=0x%02x  %d bytes",
@@ -182,21 +251,6 @@ def _on_ble_write(data: bytes, device_path: str | None = None) -> None:
                     len(data), data.hex()[:32])
         return
 
-    # When the first fragment of a new multi-fragment set arrives via the peripheral
-    # write path (device_path is set), release all scanner central connections.
-    # Android phones use random resolvable addresses that rotate, so the scanner's
-    # central connection to the phone likely uses a different MAC than the peripheral
-    # connection.  Two simultaneous BLE connections (central + peripheral) on the same
-    # radio chip cause connection-event scheduling conflicts that drop the peripheral
-    # write after ~25 fragments.  Releasing the central connection eliminates the
-    # conflict; the scanner reconnects automatically after the transfer completes.
-    if device_path is not None and pkt.type == MessageType.FRAGMENT and _scanner and _fragments:
-        frag_decoded = _decode_fragment_payload(pkt.payload)
-        if frag_decoded is not None:
-            frag_id, _, total, _, _ = frag_decoded
-            if _fragments.is_new_set(frag_id):
-                asyncio.ensure_future(_scanner.disconnect_all_central())
-
     # Defer dispatch to the next event-loop tick so WriteValue returns first.
     # BlueZ only sends ATT_WRITE_RSP (write ack) after the method reply; if we
     # emit a PropertiesChanged notification before that, some phones receive the
@@ -211,7 +265,7 @@ def _on_ble_write(data: bytes, device_path: str | None = None) -> None:
 
 async def _ipc_command_handler(cmd: dict) -> dict | None:
     if _session_mgr is None:
-        return {"ok": False, "error": "daemon not ready"}
+        return {"ok": False, "error": "not_ready"}
     return await _session_mgr.handle_command(cmd)
 
 
@@ -225,26 +279,37 @@ async def _run_bluetoothctl(*args: str) -> None:
     await proc.communicate()
 
 
+async def _adapter_is_powered() -> bool:
+    proc = await asyncio.create_subprocess_exec(
+        "bluetoothctl", "show",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await proc.communicate()
+    return b"Powered: yes" in out
+
+
 async def _ensure_adapter_up() -> None:
     """
-    Soft-reset the BLE adapter (power off → on) then wait for Powered: yes.
+    Bring the BLE adapter up, cycling power only when necessary.
 
-    The power cycle clears any stale GATT application or advertisement
-    registrations left by a previous process crash — far faster than a full
-    `systemctl restart bluetooth` and avoids the 2-5 minute rediscovery delay.
+    When the adapter is already powered (clean daemon restart via SIGTERM),
+    skip the power cycle so existing phone connections survive.  A power
+    cycle drops all BLE connections, forcing phones to re-discover the Pi
+    which can take 30 s–2 min in background mode.
+
+    A power cycle IS performed when the adapter is down (e.g. first boot,
+    after `systemctl restart bluetooth`, or after a hard crash that left
+    the adapter in a bad state).
     """
-    log.info("Soft-resetting BLE adapter to clear stale registrations…")
-    await _run_bluetoothctl("power", "off")
-    await asyncio.sleep(1)
+    if await _adapter_is_powered():
+        log.info("BLE adapter already powered — skipping power cycle")
+        return
+
+    log.info("BLE adapter is down — powering on…")
     await _run_bluetoothctl("power", "on")
 
     for attempt in range(15):
-        proc = await asyncio.create_subprocess_exec(
-            "bluetoothctl", "show",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-        )
-        out, _ = await proc.communicate()
-        if b"Powered: yes" in out:
+        if await _adapter_is_powered():
             log.info("BLE adapter ready after %d s", attempt + 1)
             return
         await asyncio.sleep(1)
@@ -253,7 +318,7 @@ async def _ensure_adapter_up() -> None:
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-async def run(nickname: str) -> None:
+async def run(nickname: str, sock_path: str = DEFAULT_SOCK_PATH) -> None:
     global _gatt, _scanner, _ipc, _relay, _fragments, _session_mgr, _identity
 
     await _ensure_adapter_up()
@@ -299,8 +364,13 @@ async def run(nickname: str) -> None:
     await _scanner.start()
     log.info("BLE scanner started (central role)")
 
-    _ipc = IpcServer(IPC_SOCK_PATH)
+    _ipc = IpcServer(sock_path)
     _ipc.set_command_handler(_ipc_command_handler)
+    _ipc.set_hello_provider(lambda: {
+        "event": "hello",
+        "peer_id": _identity.peer_id.hex(),
+        "nick": _session_mgr._nickname if _session_mgr else nickname,
+    })
     await _ipc.start()
 
     adv_bus = await start_le_advertisement(SERVICE_UUID, nickname)
@@ -335,6 +405,7 @@ async def run(nickname: str) -> None:
 
 if __name__ == "__main__":
     import argparse
+    import fcntl
     import signal
 
     parser = argparse.ArgumentParser(description="BitChatPi mesh daemon")
@@ -342,12 +413,26 @@ if __name__ == "__main__":
         "--nick", default="BitChatPi", metavar="NAME",
         help="Nickname to broadcast on the mesh (default: %(default)s)",
     )
+    parser.add_argument(
+        "--sock", default=DEFAULT_SOCK_PATH, metavar="PATH",
+        help="Unix socket path for the IPC API (default: %(default)s)",
+    )
     args = parser.parse_args()
+
+    # Prevent two daemon instances from running simultaneously.
+    _lock_path = str(Path.home() / ".config" / "bitchatd" / "daemon.lock")
+    Path(_lock_path).parent.mkdir(parents=True, exist_ok=True)
+    _lock_fh = open(_lock_path, "w")
+    try:
+        fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.error("Another bitchatd instance is already running — exiting.")
+        sys.exit(1)
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    main_task = loop.create_task(run(args.nick))
+    main_task = loop.create_task(run(args.nick, args.sock))
 
     def _shutdown(signum, frame):
         loop.call_soon_threadsafe(main_task.cancel)
@@ -359,4 +444,11 @@ if __name__ == "__main__":
     except (KeyboardInterrupt, asyncio.CancelledError):
         log.info("Interrupted.")
     finally:
+        # Release the lock before closing the loop so systemd can immediately
+        # start the replacement instance rather than hitting BlockingIOError.
+        try:
+            fcntl.flock(_lock_fh, fcntl.LOCK_UN)
+            _lock_fh.close()
+        except Exception:
+            pass
         loop.close()

@@ -65,6 +65,7 @@ class _FragmentSet:
     original_type: int
     total: int
     timestamp_ms: float
+    sender_hex: str = ""
     fragments: dict[int, bytes] = field(default_factory=dict)
     cumulative_bytes: int = 0
 
@@ -77,12 +78,22 @@ class FragmentManager:
     100% iOS/Android compatible — matches FragmentManager.kt logic.
     """
 
+    # Partial fragment sets are saved here when they expire close-to-complete.
+    # If the sender retransmits the same ciphertext with a new frag_id (common
+    # for automatic retry), the new set inherits these fragments and may complete
+    # on the first new fragment that fills the gap.
+    _RESCUE_TTL_MS       = 600_000   # 10 minutes
+    _RESCUE_MIN_FRACTION = 0.90      # only rescue sets ≥ 90 % received
+
     def __init__(self) -> None:
         self._lock = Lock()
         self._sets: dict[str, _FragmentSet] = {}
         self._global_bytes: int = 0
         self.on_reassembled: Optional[Callable[[BitchatPacket], Awaitable[None]]] = None
         self._cleanup_task: Optional[asyncio.Task] = None
+        # rescue cache: (sender_hex, total, orig_type) → (fragments, saved_at_ms)
+        self._rescue: dict[tuple, dict[int, bytes]] = {}
+        self._rescue_ts: dict[tuple, float] = {}
 
     def start(self) -> None:
         try:
@@ -194,13 +205,31 @@ class FragmentManager:
                 # Safety: cap active sets
                 if len(self._sets) >= MAX_ACTIVE_FRAGMENT_SETS:
                     return None
+                now_ms = time.time() * 1000
+                sender_hex = packet.sender_id.hex()
+                rescue_key = (sender_hex, total, original_type)
+                inherited: dict[int, bytes] = {}
+                if rescue_key in self._rescue:
+                    if now_ms - self._rescue_ts.get(rescue_key, 0) < self._RESCUE_TTL_MS:
+                        inherited = dict(self._rescue[rescue_key])
                 self._sets[frag_key] = _FragmentSet(
                     original_type=original_type,
                     total=total,
-                    timestamp_ms=time.time() * 1000,
+                    timestamp_ms=now_ms,
+                    sender_hex=sender_hex,
                 )
-                log.info("FRAGMENT new set from %s  id=%s  total=%d  orig_type=0x%02x",
-                         packet.sender_id.hex(), frag_key[:8], total, original_type)
+                s = self._sets[frag_key]
+                if inherited:
+                    s.fragments.update(inherited)
+                    s.cumulative_bytes = sum(len(v) for v in inherited.values())
+                    self._global_bytes += s.cumulative_bytes
+                    log.info("FRAGMENT new set from %s  id=%s  total=%d  orig_type=0x%02x"
+                             "  (inherited %d/%d from rescue cache)",
+                             sender_hex, frag_key[:8], total, original_type,
+                             len(inherited), total)
+                else:
+                    log.info("FRAGMENT new set from %s  id=%s  total=%d  orig_type=0x%02x",
+                             sender_hex, frag_key[:8], total, original_type)
 
             s = self._sets[frag_key]
 
@@ -248,11 +277,31 @@ class FragmentManager:
             self._cleanup_old()
 
     def _cleanup_old(self) -> None:
-        cutoff = time.time() * 1000 - FRAGMENT_TIMEOUT_MS
+        now_ms = time.time() * 1000
+        cutoff = now_ms - FRAGMENT_TIMEOUT_MS
         with self._lock:
+            # Evict stale rescue-cache entries first
+            stale_rescue = [k for k, ts in self._rescue_ts.items()
+                            if now_ms - ts > self._RESCUE_TTL_MS]
+            for k in stale_rescue:
+                self._rescue.pop(k, None)
+                self._rescue_ts.pop(k, None)
+
             expired = [k for k, s in self._sets.items() if s.timestamp_ms < cutoff]
             for k in expired:
                 s = self._sets[k]
-                log.warning("FRAGMENT set expired  id=%s  received=%d/%d  orig_type=0x%02x",
-                            k[:8], len(s.fragments), s.total, s.original_type)
+                received = len(s.fragments)
+                missing = sorted(set(range(s.total)) - set(s.fragments.keys()))
+                log.warning("FRAGMENT set expired  id=%s  received=%d/%d  orig_type=0x%02x"
+                            "  missing=%s",
+                            k[:8], received, s.total, s.original_type, missing)
+                # Save to rescue cache if this set was nearly complete; if the
+                # sender retransmits the same ciphertext with a fresh frag_id
+                # the new set can inherit these fragments and close the gap.
+                if s.sender_hex and received >= s.total * self._RESCUE_MIN_FRACTION:
+                    rescue_key = (s.sender_hex, s.total, s.original_type)
+                    self._rescue[rescue_key] = dict(s.fragments)
+                    self._rescue_ts[rescue_key] = now_ms
+                    log.info("FRAGMENT rescue cache saved  sender=%s  total=%d  frags=%d",
+                             s.sender_hex[:8], s.total, received)
                 self._remove_set(k)

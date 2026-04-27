@@ -301,6 +301,7 @@ class SessionManager:
         self._sessions:           dict[str, NoiseSession]              = {}
         self._peers:              dict[str, str]                       = {}
         self._peer_noise_pub:     dict[str, bytes]                     = {}
+        self._peer_last_seen:     dict[str, float]                     = {}
         self._last_announced:     dict[str, float]                     = {}
         self._last_msg1:          dict[str, bytes]                     = {}
         self._pending_msg2:       dict[str, bytes]                     = {}
@@ -381,6 +382,7 @@ class SessionManager:
 
     def handle_packet(self, pkt: BitchatPacket) -> None:
         peer_hex = pkt.sender_id.hex()
+        self._peer_last_seen[peer_hex] = time.time()
         if pkt.type == MessageType.ANNOUNCE:
             self._handle_announce(pkt, peer_hex)
         elif pkt.type == MessageType.NOISE_HANDSHAKE:
@@ -407,7 +409,8 @@ class SessionManager:
             if self._peers.get(peer_hex) != ann.nickname:
                 self._peers[peer_hex] = ann.nickname
                 self._publish({"event": "peer", "action": "seen",
-                               "peer_id": peer_hex, "nick": ann.nickname})
+                               "peer_id": peer_hex, "nick": ann.nickname,
+                               "last_seen": self._peer_last_seen.get(peer_hex, time.time())})
             # Detect noise_pub change — peer restarted with a new noise keypair.
             # Reset the session so a fresh handshake can happen immediately.
             old_noise_pub = self._peer_noise_pub.get(peer_hex)
@@ -447,6 +450,19 @@ class SessionManager:
             return
 
         log.info("NOISE_HANDSHAKE from %s  %d bytes", peer_hex, len(pkt.payload))
+
+        # If session is already established and we receive a new msg1 (32-byte
+        # ephemeral), the peer wants a fresh handshake — e.g. after hitting its
+        # rekey limit or restarting.  Reset our side so we can respond correctly.
+        # Without this, read_handshake_message() fails on the established session,
+        # deletes it, and the next NOISE_ENCRYPTED causes a needless LEAVE cycle.
+        if sess.is_established and len(pkt.payload) == 32:
+            log.info("New msg1 from %s while session established — resetting for re-handshake",
+                     peer_hex)
+            sess = NoiseSession.create_responder(self._identity.noise_keypair)
+            self._sessions[peer_hex] = sess
+            self._pending_msg2.pop(peer_hex, None)
+            self._last_msg1.pop(peer_hex, None)
 
         # Detect duplicate msg1 — phone retried before receiving our msg2.
         if not sess.is_established and len(pkt.payload) == 32:
@@ -573,7 +589,7 @@ class SessionManager:
             msg_id, path, mime, name = value
             log.info("FILE from %s  mime=%s  saved=%s", peer_hex, mime, path)
             self._publish({"event": "file", "from": peer_hex,
-                           "nick": self._peers.get(peer_hex, peer_hex[:8]),
+                           "nick": self._peers.get(peer_hex, ""),
                            "path": path, "mime": mime, "name": name})
             try:
                 for receipt_byte in (0x03, 0x02):
@@ -596,8 +612,9 @@ class SessionManager:
         msg_id, content = value
         log.info("DECRYPTED from %s  content=%r", peer_hex, content)
         self._publish({"event": "message", "from": peer_hex,
-                       "nick": self._peers.get(peer_hex, peer_hex[:8]),
-                       "content": content, "private": True})
+                       "nick": self._peers.get(peer_hex, ""),
+                       "content": content, "private": True, "self": False,
+                       "ts": int(time.time()), "msg_id": msg_id})
 
         try:
             for receipt_byte in (0x03, 0x02):
@@ -628,7 +645,7 @@ class SessionManager:
         log.info("FILE_TRANSFER from %s  mime=%s  %d bytes  saved=%s",
                  peer_hex, mime, len(actual), path)
         self._publish({"event": "file", "from": peer_hex,
-                       "nick": self._peers.get(peer_hex, peer_hex[:8]),
+                       "nick": self._peers.get(peer_hex, ""),
                        "path": path, "mime": mime, "name": name})
 
     def _handle_public_message(self, pkt: BitchatPacket, peer_hex: str) -> None:
@@ -637,9 +654,11 @@ class SessionManager:
         except Exception:
             content = pkt.payload.hex()
         log.info("MESSAGE from %s  content=%r", peer_hex, content)
+        msg_id = str(uuid.uuid4())
         self._publish({"event": "message", "from": peer_hex,
-                       "nick": self._peers.get(peer_hex, peer_hex[:8]),
-                       "content": content, "private": False})
+                       "nick": self._peers.get(peer_hex, ""),
+                       "content": content, "private": False, "self": False,
+                       "ts": int(time.time()), "msg_id": msg_id})
 
     def _handle_request_sync(self, pkt: BitchatPacket, peer_hex: str) -> None:
         log.debug("REQUEST_SYNC from %s", peer_hex)
@@ -666,16 +685,30 @@ class SessionManager:
     async def handle_command(self, cmd: dict) -> dict | None:
         name = cmd.get("cmd")
 
+        if name == "ping":
+            return {"ok": True, "pong": True}
+
         if name == "peers":
             return {"ok": True, "event": "peers",
-                    "list": [{"peer_id": k, "nick": v}
+                    "list": [{"peer_id": k, "nick": v,
+                              "last_seen": self._peer_last_seen.get(k, 0.0)}
                              for k, v in self._peers.items()]}
+
+        if name == "set_nick":
+            nick = cmd.get("nick", "").strip()
+            if not nick:
+                return {"ok": False, "error": "invalid_params"}
+            self._nickname = nick
+            self._last_announced.clear()  # reset cooldowns so next peer echo uses new nick
+            self._send_packet(self.make_announce())
+            log.info("IPC set_nick → %r", nick)
+            return {"ok": True, "nick": nick}
 
         if name == "send":
             to_hex  = cmd.get("to", "")
             content = cmd.get("content", "")
             if not to_hex or not content:
-                return {"ok": False, "error": "missing 'to' or 'content'"}
+                return {"ok": False, "error": "invalid_params"}
             sess = self._sessions.get(to_hex)
             if sess is None or not sess.is_established:
                 msg_id = str(uuid.uuid4())
@@ -690,11 +723,11 @@ class SessionManager:
             try:
                 recipient_id = bytes.fromhex(to_hex)
             except ValueError:
-                return {"ok": False, "error": "invalid peer_id hex"}
+                return {"ok": False, "error": "invalid_peer_id"}
             payload, msg_id = _encode_message_payload(content)
             wire = sess.encrypt(payload)
             if wire is None:
-                return {"ok": False, "error": "encryption failed"}
+                return {"ok": False, "error": "encrypt_failed"}
             self._send_packet(BitchatPacket(
                 type=MessageType.NOISE_ENCRYPTED,
                 sender_id=self._identity.peer_id,
@@ -703,37 +736,48 @@ class SessionManager:
                 ttl=MESSAGE_TTL_HOPS,
                 timestamp=int(time.time() * 1000),
             ))
+            self._publish({"event": "message",
+                           "from": self._identity.peer_id.hex(),
+                           "nick": self._nickname,
+                           "content": content, "private": True, "self": True,
+                           "ts": int(time.time()), "msg_id": msg_id})
             log.info("IPC send→%s  content=%r", to_hex[:12], content)
             return {"ok": True, "msg_id": msg_id}
 
         if name == "broadcast":
             content = cmd.get("content", "")
             if not content:
-                return {"ok": False, "error": "missing 'content'"}
+                return {"ok": False, "error": "invalid_params"}
+            msg_id = str(uuid.uuid4())
             self._send_packet(self.make_message_packet(content))
+            self._publish({"event": "message",
+                           "from": self._identity.peer_id.hex(),
+                           "nick": self._nickname,
+                           "content": content, "private": False, "self": True,
+                           "ts": int(time.time()), "msg_id": msg_id})
             log.info("IPC broadcast  content=%r", content)
-            return {"ok": True}
+            return {"ok": True, "msg_id": msg_id}
 
         if name == "send_file":
             to_hex    = cmd.get("to", "")
             file_path = cmd.get("path", "")
             if not to_hex or not file_path:
-                return {"ok": False, "error": "missing 'to' or 'path'"}
+                return {"ok": False, "error": "invalid_params"}
             try:
                 file_data = Path(file_path).read_bytes()
             except Exception as exc:
-                return {"ok": False, "error": f"cannot read file: {exc}"}
+                return {"ok": False, "error": "file_read_error", "detail": str(exc)}
             sess = self._sessions.get(to_hex)
             if sess is None or not sess.is_established:
-                return {"ok": False, "error": "no established session — send a DM first"}
+                return {"ok": False, "error": "no_session"}
             try:
                 recipient_id = bytes.fromhex(to_hex)
             except ValueError:
-                return {"ok": False, "error": "invalid peer_id hex"}
+                return {"ok": False, "error": "invalid_peer_id"}
             payload, msg_id = _encode_file_payload(file_data)
             wire = sess.encrypt(payload)
             if wire is None:
-                return {"ok": False, "error": "encryption failed"}
+                return {"ok": False, "error": "encrypt_failed"}
             self._fragment_and_send(BitchatPacket(
                 type=MessageType.NOISE_ENCRYPTED,
                 sender_id=self._identity.peer_id,
@@ -746,4 +790,4 @@ class SessionManager:
                      to_hex[:12], file_path, len(file_data))
             return {"ok": True, "msg_id": msg_id}
 
-        return {"ok": False, "error": f"unknown command: {name!r}"}
+        return {"ok": False, "error": "unknown_command"}

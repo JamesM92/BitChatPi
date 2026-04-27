@@ -1,0 +1,31 @@
+# BitChatPi daemon service — written by NodeBot BitChat installer.
+# Runs the BLE mesh daemon as root (required for BlueZ D-Bus GATT access).
+# Adjust /opt/bitchatpi if you installed BitChatPi to a non-default location.
+
+[Unit]
+Description=BitChatPi BLE mesh daemon
+Documentation=https://github.com/JamesM92/BitChatPi
+After=bluetooth.target
+Requires=bluetooth.target
+
+[Service]
+Type=simple
+User=root
+
+# Restart Bluetooth on startup to clear any stale BLE advertiser state.
+ExecStartPre=/bin/systemctl restart bluetooth
+ExecStartPre=/bin/sleep 3
+
+ExecStart=/opt/bitchatpi/.venv/bin/python3 /opt/bitchatpi/server/daemon.py
+ExecStartPost=/bin/bash -c 'for i in $(seq 1 15); do [ -S /root/.config/bitchatd/api.sock ] && chmod 0666 /root/.config/bitchatd/api.sock && break || sleep 1; done'
+
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/tmp/bitchatd.log
+StandardError=append:/tmp/bitchatd.log
+Environment=PYTHONUNBUFFERED=1
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

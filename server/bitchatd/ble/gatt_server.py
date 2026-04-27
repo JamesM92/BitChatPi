@@ -62,6 +62,7 @@ class _GattApplication(ServiceInterface):
                     "Flags":   Variant("as", [
                         "read",
                         "write",
+                        "write-without-response",
                         "notify",
                     ]),
                 }
@@ -116,7 +117,7 @@ class _GattCharacteristic(ServiceInterface):
 
     @dbus_property(access=PropertyAccess.READ)
     def Flags(self) -> "as":
-        return ["read", "write", "notify"]
+        return ["read", "write", "write-without-response", "notify"]
 
     @dbus_property(access=PropertyAccess.READ)
     def Notifying(self) -> "b":

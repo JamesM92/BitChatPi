@@ -52,7 +52,9 @@ SYNC_TTL_HOPS    = 0   # TTL for neighbour-only sync packets
 # AppConstants.Fragmentation  +  FragmentPayload.kt
 FRAGMENT_SIZE_THRESHOLD   = 512       # fragment if encoded packet > this (bytes)
 MAX_FRAGMENT_SIZE         = 469       # max data bytes per chunk
-FRAGMENT_TIMEOUT_MS       = 60_000    # discard incomplete sets after this
+FRAGMENT_TIMEOUT_MS       = 300_000   # 5 min — intentionally longer than Android's 60 s.
+                                      # Sender has no timeout; longer window lets Pi accumulate
+                                      # unique fragment indices across BLE reconnects.
 FRAGMENT_CLEANUP_MS       = 10_000    # how often to run cleanup
 MAX_FRAGMENTS_PER_ID      = 256
 MAX_FRAGMENT_TOTAL_BYTES  = 1_048_576 # per fragment set

@@ -53,6 +53,7 @@ class BleScanner:
         self._skip_until: dict[str, float] = {}      # address → backoff expiry timestamp
         self._scanner: BleakScanner | None = None
         self._running = False
+        self._paused_until: float = 0.0              # suppress new connections until this time
 
     _RAPID_DISCONNECT_SECS = 5.0   # connection shorter than this counts as a failure
     _MAX_BACKOFF_SECS       = 300  # 5 minutes ceiling
@@ -85,6 +86,8 @@ class BleScanner:
         self._last_seen[addr] = device
         if addr in self._clients or addr in self._connecting:
             return
+        if time.monotonic() < self._paused_until:
+            return  # scanner paused while receiving peripheral fragment writes
         skip = self._skip_until.get(addr, 0)
         if skip and time.monotonic() < skip:
             return
@@ -96,7 +99,10 @@ class BleScanner:
         addr = device.address
         if addr in self._clients or addr in self._connecting:
             return
+        if time.monotonic() < self._paused_until:
+            return  # scanner paused while receiving peripheral fragment writes
         self._connecting.add(addr)
+        client: BleakClient | None = None
         try:
             client = BleakClient(
                 device,
@@ -104,6 +110,24 @@ class BleScanner:
             )
             await client.connect()
             log.info("CENTRAL connected to %s", addr)
+
+            # Enumerate services to catch stale-cache failures and diagnose
+            # characteristic UUID mismatches. client.services is populated by
+            # connect() in bleak 3.x (get_services() was removed).
+            services = client.services  # BleakGATTServiceCollection
+            bitchat_svc = services.get_service(self._service_uuid)
+            if bitchat_svc is None:
+                svc_uuids = [s.uuid for s in services]
+                raise RuntimeError(
+                    f"BitChat service {self._service_uuid} missing — "
+                    f"found: {svc_uuids or '(none)'}"
+                )
+            char_uuids = [c.uuid for c in bitchat_svc.characteristics]
+            if self._char_uuid not in char_uuids:
+                raise RuntimeError(
+                    f"BitChat char {self._char_uuid} missing from service — "
+                    f"chars found: {char_uuids}"
+                )
 
             def _notify(sender: int, data: bytearray) -> None:
                 self._on_receive(bytes(data), None)
@@ -118,18 +142,60 @@ class BleScanner:
             self._fail_count[addr] = count
             backoff = min(self._MAX_BACKOFF_SECS, 10 * (3 ** (count - 1)))
             self._skip_until[addr] = time.monotonic() + backoff
-            log.debug("CENTRAL connect failed #%d for %s (backoff %.0fs): %s",
-                      count, addr, backoff, e)
+            # "service missing — found: [0x1800, 0x1801]" is expected for iOS
+            # background mode; downgrade to INFO so it doesn't flood WARNING logs.
+            msg = str(e)
+            is_background_ios = (
+                "missing — found:" in msg and
+                all(u in msg for u in ("00001800", "00001801")) and
+                self._service_uuid not in msg.split("found:")[-1]
+            )
+            lvl = logging.INFO if is_background_ios else logging.WARNING
+            log.log(lvl, "CENTRAL connect/subscribe failed #%d for %s (backoff %.0fs): %s",
+                    count, addr, backoff, e)
+            # On repeated failures, remove the device from BlueZ's GATT cache so the
+            # next attempt gets a fresh service discovery instead of stale entries.
+            if count >= 2:
+                asyncio.ensure_future(self._remove_bluez_device(addr))
+            # Explicitly disconnect to release the stale BlueZ GATT handle so the
+            # next attempt gets a fresh service discovery.  The _on_disconnected
+            # callback checks whether addr was ever added to self._clients; since
+            # it wasn't (subscription failed), it skips the rapid-disconnect backoff
+            # escalation and just honours the backoff we already set above.
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
         finally:
             self._connecting.discard(addr)
 
+    @staticmethod
+    async def _remove_bluez_device(addr: str) -> None:
+        """Remove a device from the BlueZ GATT cache to force fresh discovery."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "bluetoothctl", "remove", addr,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.communicate()
+            log.info("BlueZ device cache cleared for %s", addr)
+        except Exception as e:
+            log.debug("bluetoothctl remove %s failed: %s", addr, e)
+
     def _on_disconnected(self, addr: str) -> None:
+        was_established = addr in self._clients
         self._clients.pop(addr, None)
 
         connected_at = self._connected_at.pop(addr, None)
         duration = time.monotonic() - connected_at if connected_at is not None else 0.0
 
-        if duration < self._RAPID_DISCONNECT_SECS:
+        if not was_established:
+            # Disconnect from a failed _connect attempt (start_notify never succeeded).
+            # Backoff was already set in the except block — just schedule the retry.
+            pass
+        elif duration < self._RAPID_DISCONNECT_SECS:
             count = self._fail_count.get(addr, 0) + 1
             self._fail_count[addr] = count
             # Exponential backoff: 10s, 30s, 90s, 300s, 300s, ...
@@ -159,19 +225,37 @@ class BleScanner:
             except RuntimeError:
                 pass
 
-    async def disconnect_all_central(self) -> None:
-        """Release all outbound central connections (called when peripheral fragment write starts)."""
-        addrs = list(self._clients.keys())
-        for addr in addrs:
-            client = self._clients.pop(addr, None)
-            if client is None:
-                continue
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-        if addrs:
-            log.info("CENTRAL released %d connection(s) — peripheral fragment write in progress", len(addrs))
+    def disconnect_all_central(self) -> None:
+        """
+        Immediately release all outbound central connections and suppress new
+        ones for 2 minutes.
+
+        Called synchronously when a large peripheral fragment set starts.
+        Physical BLE teardown is fire-and-forget (background tasks); this method
+        returns in O(1) so it never blocks the event loop.
+
+        _paused_until is always updated (even when _clients is already empty)
+        so that back-to-back fragment transfers don't let the pause expire and
+        allow the scanner to reconnect mid-transfer — which causes BLE connection
+        parameter renegotiation that disrupts the in-progress peripheral writes.
+        """
+        # Always refresh the pause window, even with no active central clients.
+        self._paused_until = time.monotonic() + 120
+        if not self._clients:
+            return
+        clients = dict(self._clients)
+        self._clients.clear()
+        log.info("CENTRAL released %d connection(s) — peripheral fragment write in progress",
+                 len(clients))
+        loop = asyncio.get_running_loop()
+        for client in clients.values():
+            loop.create_task(self._bg_disconnect(client))
+
+    async def _bg_disconnect(self, client: BleakClient) -> None:
+        try:
+            await asyncio.wait_for(client.disconnect(), timeout=30.0)
+        except Exception:
+            pass
 
     async def send(self, data: bytes) -> None:
         """Write data to all peripherals we are connected to as central."""
@@ -183,6 +267,12 @@ class BleScanner:
                 await client.write_gatt_char(self._char_uuid, data, response=False)
             except Exception as e:
                 log.warning("CENTRAL write to %s failed: %s", addr, e)
+                err = str(e)
+                # D-Bus UnknownObject means the GATT handle is stale and the
+                # disconnect callback will never fire — force cleanup now.
+                if "UnknownObject" in err or "org.bluez.Error" in err:
+                    self._clients.pop(addr, None)
+                    asyncio.get_running_loop().create_task(self._bg_disconnect(client))
 
     @property
     def connected_count(self) -> int:

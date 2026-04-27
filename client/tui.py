@@ -444,6 +444,8 @@ class App:
             return False
 
         if ev == "message":
+            if obj.get("self"):
+                return False  # already shown locally when user pressed Enter
             from_id = obj.get("from", "")
             nick = obj.get("nick") or (from_id[:8] if from_id else "?")
             content = obj.get("content", "")
