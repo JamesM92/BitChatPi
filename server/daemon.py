@@ -336,7 +336,9 @@ async def _ensure_adapter_up() -> None:
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-async def run(nickname: str, sock_path: str = DEFAULT_SOCK_PATH) -> None:
+async def run(nickname: str, sock_path: str = DEFAULT_SOCK_PATH,
+              files_dir: str = "/var/lib/bitchatd/files",
+              peer_timeout: float = 300.0) -> None:
     global _gatt, _scanner, _ipc, _relay, _fragments, _session_mgr, _adv_mgr, _identity
 
     await _ensure_adapter_up()
@@ -353,7 +355,10 @@ async def run(nickname: str, sock_path: str = DEFAULT_SOCK_PATH) -> None:
 
     # Per-sender cooldown: only send one auto-reply per minute to avoid spam
     # on rapid retransmission attempts.
-    _auto_reply_last_sent: dict[str, float] = {}
+    # Track which (sender, frag_id, attempt) tuples have already been auto-replied
+    # so rapid re-expiry of the same attempt doesn't double-send, but each new
+    # attempt always gets its own notification.
+    _auto_reply_sent: set[tuple[str, str, int]] = set()
 
     def _on_fragment_expired(sender_hex: str, total: int,
                              received: int, missing: list,
@@ -363,6 +368,33 @@ async def run(nickname: str, sock_path: str = DEFAULT_SOCK_PATH) -> None:
                              content_id: str = "") -> None:
         nick = (_session_mgr.peers.get(sender_hex, "") if _session_mgr else "")
         approx_kb = round(total * 451 / 1024)
+
+        def _fmt_ranges(indices: list) -> str:
+            if not indices:
+                return ""
+            indices = sorted(indices)
+            parts, start, end = [], indices[0], indices[0]
+            for n in indices[1:]:
+                if n == end + 1:
+                    end = n
+                else:
+                    parts.append(str(start) if start == end else f"{start}-{end}")
+                    start = end = n
+            parts.append(str(start) if start == end else f"{start}-{end}")
+            return ", ".join(parts)
+
+        # Decide whether to send an auto-reply before publishing, so we can
+        # stamp auto_replied on the fragment_partial event and let the client
+        # suppress its own duplicate system note.
+        reply_key = (sender_hex, frag_id, attempt)
+        will_reply = (
+            original_type in (MessageType.FILE_TRANSFER, MessageType.NOISE_ENCRYPTED)
+            and bool(sender_hex and _session_mgr)
+            and reply_key not in _auto_reply_sent
+        )
+        if will_reply:
+            _auto_reply_sent.add(reply_key)
+
         _publish({
             "event":             "fragment_partial",
             "from":              sender_hex,
@@ -376,34 +408,31 @@ async def run(nickname: str, sock_path: str = DEFAULT_SOCK_PATH) -> None:
             "transfer_id":       frag_id[:8],
             "content_id":        content_id,
             "approx_kb":         approx_kb,
+            "auto_replied":      will_reply,
         })
-        if original_type in (MessageType.FILE_TRANSFER, MessageType.NOISE_ENCRYPTED) and sender_hex and _session_mgr:
-            _now = time.time()
-            if _now - _auto_reply_last_sent.get(sender_hex, 0) >= 60:
-                _auto_reply_last_sent[sender_hex] = _now
-                def _fmt_ranges(indices: list) -> str:
-                    if not indices:
-                        return ""
-                    indices = sorted(indices)
-                    parts, start, end = [], indices[0], indices[0]
-                    for n in indices[1:]:
-                        if n == end + 1:
-                            end = n
-                        else:
-                            parts.append(str(start) if start == end else f"{start}-{end}")
-                            start = end = n
-                    parts.append(str(start) if start == end else f"{start}-{end}")
-                    return ", ".join(parts)
-                size_note = f"~{approx_kb}KB" if approx_kb else "unknown size"
+
+        if will_reply:
+            size_note = f"~{approx_kb}KB" if approx_kb else "unknown size"
+            if attempt > 1 and combined_missing != missing:
                 reply = (
-                    f"[auto] Transfer incomplete (attempt #{attempt}, "
-                    f"{received}/{total} fragments, {size_note}, "
-                    f"missing=[{_fmt_ranges(missing)}]). "
+                    f"Transfer incomplete — attempt #{attempt}, "
+                    f"{received}/{total} fragments ({size_note}) received. "
+                    f"Holding {combined_received}/{total} overall, "
+                    f"still missing: [{_fmt_ranges(combined_missing)}]. "
                     f"Please try again."
                 )
-                asyncio.ensure_future(
-                    _session_mgr.handle_command({"cmd": "send", "to": sender_hex, "content": reply})
+            else:
+                reply = (
+                    f"Transfer incomplete — attempt #{attempt}, "
+                    f"{received}/{total} fragments ({size_note}), "
+                    f"missing: [{_fmt_ranges(missing)}]. "
+                    f"Please try again."
                 )
+            asyncio.ensure_future(
+                _session_mgr.handle_command(
+                    {"cmd": "send", "to": sender_hex, "content": reply, "auto": True}
+                )
+            )
         if _adv_mgr and not _fragments.is_receiving():
             asyncio.ensure_future(_adv_mgr.resume())
 
@@ -446,13 +475,24 @@ async def run(nickname: str, sock_path: str = DEFAULT_SOCK_PATH) -> None:
 
     _fragments.on_fragment_set_started = _on_fragment_set_started
 
+    def _is_reachable() -> bool:
+        if _gatt and _gatt.notifying:
+            return True
+        if _scanner and _scanner.connected_count > 0:
+            return True
+        return False
+
     _session_mgr = SessionManager(
         identity=_identity,
         nickname=nickname,
         send_packet=_send_packet,
         fragment_and_send=_fragment_and_send,
         publish=_publish,
+        files_dir=Path(files_dir),
+        peer_timeout=peer_timeout,
+        is_reachable=_is_reachable,
     )
+    await _session_mgr.start()
 
     _first_notify_done = False
 
@@ -549,6 +589,8 @@ async def run(nickname: str, sock_path: str = DEFAULT_SOCK_PATH) -> None:
                 await _adv_mgr.stop()
         except Exception:
             pass
+        if _session_mgr:
+            await _session_mgr.stop()
         if _scanner:
             await _scanner.stop()
         await _gatt.stop()
@@ -573,6 +615,14 @@ if __name__ == "__main__":
         "--sock", default=DEFAULT_SOCK_PATH, metavar="PATH",
         help="Unix socket path for the IPC API (default: %(default)s)",
     )
+    parser.add_argument(
+        "--files-dir", default="/var/lib/bitchatd/files", metavar="PATH",
+        help="Directory where received files are saved (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--peer-timeout", default=300.0, type=float, metavar="SECONDS",
+        help="Seconds without an ANNOUNCE before a peer is marked lost (default: %(default)s)",
+    )
     args = parser.parse_args()
 
     # Prevent two daemon instances from running simultaneously.
@@ -588,7 +638,8 @@ if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    main_task = loop.create_task(run(args.nick, args.sock))
+    main_task = loop.create_task(run(args.nick, args.sock,
+                                     args.files_dir, args.peer_timeout))
 
     def _shutdown(signum, frame):
         loop.call_soon_threadsafe(main_task.cancel)

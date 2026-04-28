@@ -6,9 +6,32 @@ A Raspberry Pi BLE mesh node for the [Nodebot](https://github.com/JamesM92/Nodeb
 
 ---
 
+## ⚠️ Project status: abandoned
+
+**This project is not actively maintained and is unlikely to be reactivated without major changes to the upstream BitChat protocol.**
+
+BitChatPi was built with the intention of using it as a mesh bridge for [Nodebot](https://github.com/JamesM92/Nodebot). After development, it was determined that the integration is impractical for Nodebot's use case and the project has been set aside.
+
+### Known fundamental issue — image/file transfers
+
+There is no acknowledgement mechanism in the BitChat protocol for partial or complete transfer failures from the **sender's perspective**. When an image or file transfer fails:
+
+- The **sender** receives no indication that the transfer failed — it fails silently on the sending side.
+- The **receiver** may time out waiting for missing fragments, but the feedback loop back to the sender relies entirely on out-of-band DMs (implemented here as auto-replies), which the upstream Android app does not natively act on.
+
+This means reliable file transfer over the mesh is not achievable without protocol-level changes upstream. Until the BitChat protocol gains a proper ACK/NACK mechanism for fragment transfers, there is no clean path forward for robust file exchange.
+
+### Why Nodebot integration was dropped
+
+Nodebot requires dependable message delivery guarantees. The silent-failure behaviour of fragment transfers, combined with the constraints of BLE bandwidth and the lack of upstream protocol support for delivery confirmation, makes BitChatPi impractical as a Nodebot bridge component. Re-activating this integration would require either a significant protocol extension in upstream BitChat or a fundamentally different approach to the mesh layer.
+
+The code is left here as a reference. Text messaging over the mesh works reliably; the issues are specific to binary/image transfers.
+
+---
+
 ## What this is
 
-[Nodebot](https://github.com/JamesM92/Nodebot) relies on a reliable always-on mesh node that bridges between online and offline network segments. BitChatPi fills that role: it runs the [BitChat](https://github.com/permadao/BitChat) BLE mesh protocol on a Raspberry Pi, keeping a persistent node alive on the local mesh so Nodebot can route messages through it.
+[Nodebot](https://github.com/JamesM92/Nodebot) relies on a reliable always-on mesh node that bridges between online and offline network segments. BitChatPi was built to fill that role: it runs the [BitChat](https://github.com/permadao/BitChat) BLE mesh protocol on a Raspberry Pi, keeping a persistent node alive on the local mesh so Nodebot can route messages through it.
 
 The Pi operates as a **symmetric BLE mesh node** — it simultaneously acts as a GATT peripheral (advertising and accepting connections from phones) and a BLE central (scanning for and connecting to other BitChat peers). It performs the Noise XX handshake with each peer, relays mesh traffic, and exposes a local IPC socket for other processes to send and receive messages.
 

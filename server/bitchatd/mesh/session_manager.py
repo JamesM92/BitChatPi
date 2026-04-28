@@ -12,6 +12,7 @@ daemon.py owns BLE I/O and process lifecycle; it supplies send_packet,
 fragment_and_send, and publish as callbacks at construction time.
 """
 from __future__ import annotations
+import asyncio
 import logging
 import struct
 import time
@@ -29,8 +30,10 @@ from ..crypto.signing import sign
 
 log = logging.getLogger(__name__)
 
-_ANNOUNCE_COOLDOWN = 10.0   # seconds — minimum gap between ANNOUNCE echoes per peer
-_PENDING_SEND_TTL  = 600.0  # seconds — drop queued messages after this long
+_ANNOUNCE_COOLDOWN    = 10.0   # seconds — minimum gap between ANNOUNCE echoes per peer
+_PENDING_SEND_TTL     = 600.0  # seconds — drop queued messages after this long
+_DEFAULT_PEER_TIMEOUT = 300.0  # seconds — peer removed if no ANNOUNCE received in this window
+_DEFAULT_FILES_DIR    = Path("/var/lib/bitchatd/files")
 
 _FILE_MAGIC: list[tuple[bytes, str, str]] = [
     (b'\xff\xd8\xff',           ".jpg",  "image/jpeg"),
@@ -112,20 +115,19 @@ def _sniff_file(data: bytes) -> tuple[str, str]:
     return ".bin", "application/octet-stream"
 
 
-_FILES_DIR = Path.home() / ".config" / "bitchatd" / "files"
-
-
-def _save_received_file(msg_id: str, data: bytes) -> tuple[str, str]:
-    """Save binary data to ~/.config/bitchatd/files/, return (path, mime)."""
-    _FILES_DIR.mkdir(parents=True, exist_ok=True)
+def _save_received_file(msg_id: str, data: bytes,
+                        files_dir: Path = _DEFAULT_FILES_DIR) -> tuple[str, str]:
+    """Save binary data to files_dir, return (path, mime)."""
+    files_dir.mkdir(parents=True, exist_ok=True)
     ext, mime = _sniff_file(data)
-    path = str(_FILES_DIR / f"bitchat_{msg_id[:8]}{ext}")
+    path = str(files_dir / f"bitchat_{msg_id[:8]}{ext}")
     with open(path, "wb") as fh:
         fh.write(data)
     return path, mime
 
 
-def _parse_incoming(plaintext: bytes) -> tuple[str, object] | None:
+def _parse_incoming(plaintext: bytes,
+                    files_dir: Path = _DEFAULT_FILES_DIR) -> tuple[str, object] | None:
     """
     Parse a decrypted NOISE_ENCRYPTED inner payload.
     Returns ('receipt', ref_uuid_str)
@@ -133,12 +135,16 @@ def _parse_incoming(plaintext: bytes) -> tuple[str, object] | None:
           | ('file',    (msg_id, path, mime, name))
           | None
     """
-    # ── Receipt: exactly 37 bytes, first byte 0x02 (read) or 0x03 (delivery) ─
-    if len(plaintext) == 37 and plaintext[0] in (0x02, 0x03):
+    # ── Receipt: ≥37 bytes, first byte 0x02 (read) or 0x03 (delivery) ─────────
+    # Android may append extra bytes (e.g. a timestamp) after the UUID.
+    if len(plaintext) >= 37 and plaintext[0] in (0x02, 0x03):
         try:
-            return ('receipt', plaintext[1:37].decode('ascii'))
+            ref = plaintext[1:37].decode('ascii')
+            if len(ref) == 36 and ref[8] == '-' and ref[13] == '-':
+                return ('receipt', ref)
+            log.debug("Receipt byte found but UUID shape invalid: %r", ref)
         except Exception as exc:
-            log.debug("Receipt parse failed: %s", exc)
+            log.debug("Receipt parse failed: %s  raw=%s", exc, plaintext[:40].hex())
 
     # ── Standard framing: flags(1) | id_len(uint16 BE) | id(36) | msg_type(1) ─
     if len(plaintext) >= 41:
@@ -161,7 +167,7 @@ def _parse_incoming(plaintext: bytes) -> tuple[str, object] | None:
                         if _sniff_file(rest[off:])[1] != "application/octet-stream":
                             data = rest[off:]
                             break
-                    path, mime = _save_received_file(msg_id, data)
+                    path, mime = _save_received_file(msg_id, data, files_dir)
                     name = f"file{_sniff_file(data)[0]}"
                     log.info("Binary file  mime=%s  %d bytes  saved=%s", mime, len(data), path)
                     return ('file', (msg_id, path, mime, name))
@@ -192,7 +198,7 @@ def _parse_incoming(plaintext: bytes) -> tuple[str, object] | None:
                 msg_id = str(uuid.uuid4())
                 detected_ext, detected_mime = _sniff_file(file_data)
                 actual_mime = mime_type.decode(errors="replace") if mime_type else detected_mime
-                path, _ = _save_received_file(msg_id, file_data)
+                path, _ = _save_received_file(msg_id, file_data, files_dir)
                 name = fname.decode(errors="replace") if fname else f"file{detected_ext}"
                 log.info("FILE_TRANSFER TLV: name=%s  mime=%s  %d bytes",
                          name, actual_mime, len(file_data))
@@ -221,7 +227,7 @@ def _parse_incoming(plaintext: bytes) -> tuple[str, object] | None:
                                 if off < len(data) and _sniff_file(data[off:])[1] != "application/octet-stream":
                                     data = data[off:]
                                     break
-                            path, mime = _save_received_file(msg_id, data)
+                            path, mime = _save_received_file(msg_id, data, files_dir)
                             name = f"file{_sniff_file(data)[0]}"
                             return ('file', (msg_id, path, mime, name))
         except Exception as exc:
@@ -233,7 +239,7 @@ def _parse_incoming(plaintext: bytes) -> tuple[str, object] | None:
             ext, mime = _sniff_file(plaintext[off:])
             if mime != "application/octet-stream":
                 msg_id = str(uuid.uuid4())
-                path, _ = _save_received_file(msg_id, plaintext[off:])
+                path, _ = _save_received_file(msg_id, plaintext[off:], files_dir)
                 name = f"file{ext}"
                 log.info("Raw file detected at offset %d  mime=%s", off, mime)
                 return ('file', (msg_id, path, mime, name))
@@ -252,7 +258,7 @@ def _parse_incoming(plaintext: bytes) -> tuple[str, object] | None:
                     ext, mime = _sniff_file(dec[off:])
                     if mime != "application/octet-stream":
                         msg_id = str(uuid.uuid4())
-                        path, _ = _save_received_file(msg_id, dec[off:])
+                        path, _ = _save_received_file(msg_id, dec[off:], files_dir)
                         name = f"file{ext}"
                         log.info("Decompressed file at offset %d  mime=%s", off, mime)
                         return ('file', (msg_id, path, mime, name))
@@ -264,7 +270,7 @@ def _parse_incoming(plaintext: bytes) -> tuple[str, object] | None:
             plaintext.decode('utf-8')
         except UnicodeDecodeError:
             msg_id = str(uuid.uuid4())
-            path, mime = _save_received_file(msg_id, plaintext)
+            path, mime = _save_received_file(msg_id, plaintext, files_dir)
             ext, _ = _sniff_file(plaintext)
             name = f"file{ext}"
             log.info("Binary blob saved (unknown format): mime=%s  %d bytes  saved=%s",
@@ -295,12 +301,18 @@ class SessionManager:
         send_packet: Callable[[BitchatPacket], None],      # sends a single packet
         fragment_and_send: Callable[[BitchatPacket], None],# fragments if needed, then sends
         publish: Callable[[dict], None],                   # pushes an IPC event
+        files_dir: Path = _DEFAULT_FILES_DIR,
+        peer_timeout: float = _DEFAULT_PEER_TIMEOUT,
+        is_reachable: Callable[[], bool] = lambda: True,   # returns False when no BLE subscriber
     ) -> None:
         self._identity          = identity
         self._nickname          = nickname
         self._send_packet       = send_packet
         self._fragment_and_send = fragment_and_send
         self._publish           = publish
+        self._files_dir         = files_dir
+        self._peer_timeout      = peer_timeout
+        self._is_reachable      = is_reachable
 
         self._sessions:           dict[str, NoiseSession]              = {}
         self._peers:              dict[str, str]                       = {}
@@ -312,6 +324,7 @@ class SessionManager:
         self._pending_sends:      dict[str, list[tuple[str, str, float]]] = {}
         self._session_timestamps: dict[str, float]                     = {}
         self._decrypt_fail_count: dict[str, int]                       = {}
+        self._timeout_task:       Optional[asyncio.Task]               = None
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -326,6 +339,42 @@ class SessionManager:
     def has_session(self, peer_hex: str) -> bool:
         """Return True if we have any state for this peer (session or peer registry)."""
         return peer_hex in self._sessions or peer_hex in self._peers
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    async def start(self) -> None:
+        """Start background tasks (peer timeout sweep)."""
+        self._timeout_task = asyncio.ensure_future(self._peer_timeout_loop())
+        log.info("Peer timeout active: %.0f s", self._peer_timeout)
+
+    async def stop(self) -> None:
+        if self._timeout_task:
+            self._timeout_task.cancel()
+            self._timeout_task = None
+
+    async def _peer_timeout_loop(self) -> None:
+        while True:
+            await asyncio.sleep(30)
+            now   = time.time()
+            stale = [
+                peer_hex
+                for peer_hex, last in self._peer_last_seen.items()
+                if now - last > self._peer_timeout and peer_hex in self._peers
+            ]
+            for peer_hex in stale:
+                nick = self._peers.pop(peer_hex, peer_hex[:8])
+                self._sessions.pop(peer_hex, None)
+                self._pending_msg2.pop(peer_hex, None)
+                self._last_msg1.pop(peer_hex, None)
+                self._session_timestamps.pop(peer_hex, None)
+                self._peer_noise_pub.pop(peer_hex, None)
+                self._last_announced.pop(peer_hex, None)
+                self._pending_sends.pop(peer_hex, None)
+                self._peer_last_seen.pop(peer_hex, None)
+                log.info("Peer timed out (no ANNOUNCE for %.0f s): %s  nick=%s",
+                         self._peer_timeout, peer_hex[:8], nick)
+                self._publish({"event": "peer", "action": "lost",
+                               "peer_id": peer_hex, "nick": nick})
 
     # ── Outgoing packet builders ───────────────────────────────────────────────
 
@@ -558,6 +607,11 @@ class SessionManager:
                     timestamp=int(time.time() * 1000),
                 ))
                 log.info("Delivered queued message to %s: %r", peer_hex[:12], content)
+                # Notify IPC clients that a previously-queued message was delivered.
+                # The client may already be showing a "queued" row; the receipt
+                # events that follow will add checkmarks to that row via msg_id.
+                self._publish({"event": "message_delivered",
+                               "msg_id": msg_id, "to": peer_hex})
 
     def _handle_noise_encrypted(self, pkt: BitchatPacket, peer_hex: str) -> None:
         sess = self._sessions.get(peer_hex)
@@ -597,7 +651,7 @@ class SessionManager:
 
         self._decrypt_fail_count.pop(peer_hex, None)  # reset on successful decrypt
 
-        parsed = _parse_incoming(plaintext)
+        parsed = _parse_incoming(plaintext, self._files_dir)
         if parsed is None:
             log.warning("Unknown NOISE_ENCRYPTED format from %s  len=%d  hex=%s…",
                         peer_hex, len(plaintext), plaintext[:64].hex())
@@ -667,7 +721,7 @@ class SessionManager:
                 actual = data[off:]
                 break
         msg_id = str(uuid.uuid4())
-        path, mime = _save_received_file(msg_id, actual)
+        path, mime = _save_received_file(msg_id, actual, self._files_dir)
         name = f"file{_sniff_file(actual)[0]}"
         log.info("FILE_TRANSFER from %s  mime=%s  %d bytes  saved=%s",
                  peer_hex, mime, len(actual), path)
@@ -710,6 +764,12 @@ class SessionManager:
     # ── IPC command handler ────────────────────────────────────────────────────
 
     async def handle_command(self, cmd: dict) -> dict | None:
+        result = await self._dispatch_command(cmd)
+        if isinstance(result, dict) and "cmd" not in result:
+            result["cmd"] = cmd.get("cmd", "")
+        return result
+
+    async def _dispatch_command(self, cmd: dict) -> dict | None:
         name = cmd.get("cmd")
 
         if name == "ping":
@@ -736,17 +796,32 @@ class SessionManager:
             content = cmd.get("content", "")
             if not to_hex or not content:
                 return {"ok": False, "error": "invalid_params"}
+            is_auto = bool(cmd.get("auto"))
             sess = self._sessions.get(to_hex)
-            if sess is None or not sess.is_established:
+            if sess is None or not sess.is_established or not self._is_reachable():
                 msg_id = str(uuid.uuid4())
                 self._pending_sends.setdefault(to_hex, []).append(
                     (content, msg_id, time.time()))
                 self._last_announced.pop(to_hex, None)
                 self._send_packet(self.make_announce())
                 self._last_announced[to_hex] = time.time()
-                log.info("No session for %s — queued message, sent ANNOUNCE invite",
-                         to_hex[:12])
-                return {"ok": True, "msg_id": msg_id}
+                if sess is not None and sess.is_established:
+                    log.info("No BLE subscriber for %s — queued message, sent ANNOUNCE invite",
+                             to_hex[:12])
+                else:
+                    log.info("No session for %s — queued message, sent ANNOUNCE invite",
+                             to_hex[:12])
+                # Publish echo now so the client can show the message immediately,
+                # even though delivery is deferred until the phone reconnects.
+                self._publish({"event": "message",
+                               "from": self._identity.peer_id.hex(),
+                               "to":   to_hex,
+                               "nick": self._nickname,
+                               "content": content, "private": True,
+                               "self": True, "auto": is_auto,
+                               "ts": int(time.time()), "msg_id": msg_id,
+                               "queued": True})
+                return {"ok": True, "msg_id": msg_id, "queued": True}
             try:
                 recipient_id = bytes.fromhex(to_hex)
             except ValueError:
@@ -765,8 +840,10 @@ class SessionManager:
             ))
             self._publish({"event": "message",
                            "from": self._identity.peer_id.hex(),
+                           "to":   to_hex,
                            "nick": self._nickname,
-                           "content": content, "private": True, "self": True,
+                           "content": content, "private": True,
+                           "self": True, "auto": is_auto,
                            "ts": int(time.time()), "msg_id": msg_id})
             log.info("IPC send→%s  content=%r", to_hex[:12], content)
             return {"ok": True, "msg_id": msg_id}
@@ -783,7 +860,7 @@ class SessionManager:
                            "content": content, "private": False, "self": True,
                            "ts": int(time.time()), "msg_id": msg_id})
             log.info("IPC broadcast  content=%r", content)
-            return {"ok": True, "msg_id": msg_id}
+            return {"ok": True, "msg_id": msg_id, "reliable": False}
 
         if name == "send_file":
             to_hex    = cmd.get("to", "")

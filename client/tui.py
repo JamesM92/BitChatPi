@@ -165,16 +165,19 @@ class PeerButton(urwid.WidgetWrap):
     """Selectable, clickable peer list entry."""
 
     def __init__(self, peer_id: str, nick: str, active: bool, unread: bool,
-                 on_select) -> None:
+                 offline: bool, on_select) -> None:
         self._peer_id = peer_id
         self._on_select = on_select
 
         if active:
-            label = f"▶ {nick}"      # ▶
+            label = f"▶ {nick}"
             normal_attr = "peer_active"
         elif unread:
-            label = f"• {nick}"      # •
+            label = f"• {nick}"
             normal_attr = "peer_unread"
+        elif offline:
+            label = f"  {nick} [away]"
+            normal_attr = "peer_normal"
         else:
             label = f"  {nick}"
             normal_attr = "peer_normal"
@@ -205,6 +208,9 @@ class App:
     def __init__(self, sock_path: str) -> None:
         self.sock_path = sock_path
         self.peers: OrderedDict[str, str] = OrderedDict([(GLOBAL_KEY, "Global")])
+        # Peers that sent LEAVE but still have conversation history — kept in the
+        # sidebar so past messages remain accessible, shown with an offline marker.
+        self.offline: set[str] = set()
         # (ts, label, text, palette_attr)
         self.chats: defaultdict[str, list[tuple[str, str, str, str]]] = defaultdict(list)
         self.active = GLOBAL_KEY
@@ -291,7 +297,7 @@ class App:
 
         items = [
             PeerButton(k, n, k == self.active, k in self.unread,
-                       self._on_peer_select)
+                       k in self.offline, self._on_peer_select)
             for k, n in self.peers.items()
         ]
         self.peer_walker[:] = items
@@ -515,33 +521,62 @@ class App:
             if action == "seen":
                 new = pid not in self.peers
                 self.peers[pid] = nick
+                self.offline.discard(pid)
                 if new:
                     self._add_sys(GLOBAL_KEY, f"+ {nick}")
                 return True
             if action == "lost":
                 if pid in self.peers:
-                    del self.peers[pid]
                     self._add_sys(GLOBAL_KEY, f"- {nick}")
+                    if self.chats[pid]:
+                        # Conversation exists — keep in sidebar as offline so
+                        # the user can still read the history.
+                        self.offline.add(pid)
+                    else:
+                        del self.peers[pid]
                     return True
             return False
 
         if ev == "message":
-            if obj.get("self"):
-                return False  # already shown locally when user pressed Enter
+            is_self = obj.get("self", False)
+            is_auto = obj.get("auto", False)
             from_id = obj.get("from", "")
-            nick = obj.get("nick") or (from_id[:8] if from_id else "?")
+            to_id   = obj.get("to", "")
+            nick    = obj.get("nick") or (from_id[:8] if from_id else "?")
             content = obj.get("content", "")
             private = obj.get("private", False)
+            msg_id  = obj.get("msg_id", "")
+
+            if is_self and is_auto:
+                # Auto-generated message (e.g. incomplete-transfer notification).
+                # Show it in the peer's DM channel so the user sees exactly what
+                # the phone received, and wire up receipt tracking.
+                peer_key = to_id if to_id else GLOBAL_KEY
+                if to_id and to_id not in self.peers:
+                    self.peers[to_id] = to_id[:8]
+                self._add_msg(peer_key, "me", content, "chat_self")
+                idx = len(self.chats[peer_key]) - 1
+                if msg_id:
+                    self._uuid_to_loc[msg_id] = (peer_key, idx)
+                return peer_key != self.active
+
+            if is_self:
+                return False  # user-typed message already shown locally when Enter was pressed
+
             if private and from_id:
                 is_new = from_id not in self.peers
                 if is_new:
                     self.peers[from_id] = nick
                 self._add_msg(from_id, nick, content, "chat_other")
-                # Rebuild if new peer, or message landed in unread (not active chat)
                 return is_new or from_id != self.active
             else:
                 self._add_msg(GLOBAL_KEY, nick, content, "chat_other")
                 return GLOBAL_KEY != self.active
+
+        if ev == "message_delivered":
+            # A previously-queued message reached the phone; receipts will follow.
+            # Nothing to display — the message row is already shown from when it was queued.
+            return False
 
         if ev == "receipt":
             rtype = obj.get("type", "")
@@ -592,8 +627,9 @@ class App:
                     f"  — completes partial{tag} (attempt #{attempt})")
             else:
                 self._add_sys(target, f"File received: {name}  [{mime}]  saved: {path}")
-            # Clickable preview row only for images (audio/video can't be played in the TUI)
-            if mime.startswith("image/"):
+            # Clickable row for all received files; _preview_file renders images as
+            # ASCII art and shows a "File saved:" notice for everything else.
+            if path:
                 self._add_msg(target, nick, f"{_FILE_TAG}{path}", "chat_system")
             return bool(is_new) or target != self.active
 
@@ -608,9 +644,16 @@ class App:
             attempt          = obj.get("attempt", 1)
             content_id       = obj.get("content_id", "")
             approx_kb        = obj.get("approx_kb", 0)
+            auto_replied     = obj.get("auto_replied", False)
             target           = from_id if from_id else GLOBAL_KEY
-            if from_id and from_id not in self.peers:
+            is_new = from_id and from_id not in self.peers
+            if from_id:
                 self.peers[from_id] = nick
+            if auto_replied:
+                # The daemon sent the peer a DM with all the details; the message
+                # echo (self+auto) will appear in this channel with receipt tracking.
+                # Don't add a separate system note that would duplicate that content.
+                return bool(is_new)
             pct          = int(100 * received / total) if total else 0
             combined_pct = int(100 * combined_received / total) if total else 0
             name = f"~{approx_kb}KB image" if approx_kb else "image"
@@ -625,7 +668,7 @@ class App:
                     f"({combined_pct}%) missing=[{_fmt_ranges(combined_missing)}]")
             if attempt == 1:
                 self._add_sys(target,
-                    "  Image incomplete — the sender has been notified automatically; "
+                    "  Image incomplete — sender has been notified; "
                     "it will appear if they resend.")
             return target != self.active
 
