@@ -58,4 +58,4 @@ echo "Done. Service status:"
 systemctl status bitchatd --no-pager -l
 echo ""
 echo "Logs:    sudo journalctl -u bitchatd -f"
-echo "         tail -f /tmp/bitchatd.log"
+echo "         tail -f /root/.config/bitchatd/bitchatd.log"

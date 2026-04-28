@@ -18,8 +18,7 @@ Android repo: https://github.com/permissionlesstech/bitchat-android
 | `mesh/PacketRelayManager.kt` | `66012e9` | 2026-01-12 | `bitchatd/mesh/relay_engine.py` |
 | `mesh/BluetoothGattServerManager.kt` | `c64ea0a` | 2026-01-15 | `bitchatd/ble/gatt_server.py` |
 | `mesh/BluetoothGattClientManager.kt` | `c64ea0a` | 2026-01-15 | `bitchatd/ble/scanner.py` |
-| `model/BitchatMessage.kt` | `633a506` | 2025-09-19 | `bitchatd/messages/message.py` |
-| `nostr/NostrRelayManager.kt` | *(not tracked — optional feature)* | — | `bitchatd/nostr/bridge.py` |
+| `model/BitchatMessage.kt` | `633a506` | 2025-09-19 | `bitchatd/mesh/session_manager.py` (inline encoder) |
 
 ---
 

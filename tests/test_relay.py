@@ -31,7 +31,7 @@ def test_ttl_zero_not_relayed():
     engine = RelayEngine(MY_ID)
     broadcast = AsyncMock()
     engine.broadcast_packet = broadcast
-    asyncio.get_event_loop().run_until_complete(
+    asyncio.run(
         engine.handle_relay(make_packet(ttl=0), PEER_ID.hex())
     )
     broadcast.assert_not_called()
@@ -44,9 +44,7 @@ def test_ttl_decremented():
 
     engine = RelayEngine(MY_ID)
     engine.broadcast_packet = capture
-    asyncio.get_event_loop().run_until_complete(
-        engine.handle_relay(make_packet(ttl=3), PEER_ID.hex())
-    )
+    asyncio.run(engine.handle_relay(make_packet(ttl=3), PEER_ID.hex()))
     assert len(relayed) == 1
     assert relayed[0].ttl == 2
 
@@ -57,9 +55,7 @@ def test_own_packet_not_relayed():
     engine = RelayEngine(MY_ID)
     broadcast = AsyncMock()
     engine.broadcast_packet = broadcast
-    asyncio.get_event_loop().run_until_complete(
-        engine.handle_relay(make_packet(), MY_ID.hex())   # from ourselves
-    )
+    asyncio.run(engine.handle_relay(make_packet(), MY_ID.hex()))
     broadcast.assert_not_called()
 
 
@@ -73,9 +69,12 @@ def test_duplicate_not_relayed_twice():
     engine = RelayEngine(MY_ID)
     engine.broadcast_packet = capture
     pkt = make_packet()
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(engine.handle_relay(pkt, PEER_ID.hex()))
-    loop.run_until_complete(engine.handle_relay(pkt, PEER_ID.hex()))
+
+    async def run_twice():
+        await engine.handle_relay(pkt, PEER_ID.hex())
+        await engine.handle_relay(pkt, PEER_ID.hex())
+
+    asyncio.run(run_twice())
     assert len(relayed) == 1
 
 

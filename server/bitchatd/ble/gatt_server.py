@@ -222,6 +222,11 @@ class GattServer:
         bus.disconnect()
         raise RuntimeError(f"Could not register GATT application after 3 attempts: {last_exc}")
 
+    @property
+    def notifying(self) -> bool:
+        """True if at least one central has subscribed to notifications."""
+        return self._char is not None and self._char._notifying
+
     def send(self, data: bytes) -> None:
         """Push raw bytes to subscribed centrals."""
         if self._char is None:
@@ -252,6 +257,27 @@ class GattServer:
             return
         path = "/org/bluez/hci0/dev_" + address.upper().replace(":", "_")
         self._char.connected_device_paths.discard(path)
+
+    async def disconnect_all_connected(self) -> None:
+        """Disconnect all devices that have written to the characteristic.
+
+        Called by the subscription watchdog when a device is actively writing
+        but has not subscribed to notifications — indicating stale iOS CCCD
+        cache.  Forcing a disconnect causes the phone to reconnect fresh and
+        re-subscribe.
+        """
+        if self._bus is None:
+            return
+        paths = set(self.connected_device_paths)
+        for device_path in paths:
+            try:
+                intro = await self._bus.introspect(_BLUEZ_BUS, device_path)
+                proxy = self._bus.get_proxy_object(_BLUEZ_BUS, device_path, intro)
+                dev   = proxy.get_interface("org.bluez.Device1")
+                await dev.call_disconnect()
+                log.info("Disconnected %s to force GATT re-subscription", device_path)
+            except Exception as e:
+                log.debug("disconnect %s: %s", device_path, e)
 
     async def stop(self, adapter_path: str = _ADAPTER_OBJ) -> None:
         if self._bus is None:

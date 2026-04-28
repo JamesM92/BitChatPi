@@ -33,7 +33,9 @@ chmod +x "$INSTALL_DIR/start-client.sh"
 echo "[2/2] Installing client Python packages..."
 "$VENV/bin/pip" install \
   "urwid==4.0.0" \
-  "pillow==12.2.0"
+  "pillow==12.2.0" \
+  "numpy" \
+  "scipy"
 
 echo ""
 echo "Done. Start the TUI with:"

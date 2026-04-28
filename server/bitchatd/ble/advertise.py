@@ -9,6 +9,7 @@ Key lessons from btmon debugging:
 from __future__ import annotations
 import asyncio
 import logging
+from typing import Optional
 
 from dbus_fast.aio import MessageBus
 from dbus_fast import BusType
@@ -102,6 +103,67 @@ async def start_le_advertisement(
 
     bus.disconnect()
     raise RuntimeError(f"Could not register advertisement after 3 attempts: {last_exc}")
+
+
+class AdvertiseManager:
+    """
+    Wraps start/stop so the daemon can pause advertising during fragment
+    reception (to free the radio scheduler) and resume afterwards.
+    """
+
+    _SAFETY_TIMEOUT_S = 60.0  # maximum time advertising may stay paused
+
+    def __init__(self, service_uuid: str, local_name: str,
+                 adapter_path: str = _ADAPTER_OBJ) -> None:
+        self._service_uuid = service_uuid
+        self._local_name   = local_name
+        self._adapter_path = adapter_path
+        self._bus: Optional[MessageBus] = None
+        self._paused = False
+        self._safety_task: Optional[asyncio.Task] = None
+
+    async def start(self) -> None:
+        self._bus = await start_le_advertisement(
+            self._service_uuid, self._local_name, self._adapter_path
+        )
+
+    async def pause(self) -> None:
+        if self._paused or self._bus is None:
+            return
+        self._paused = True
+        log.info("ADV pause — suppressing advertising during fragment reception")
+        await stop_le_advertisement(self._bus, self._adapter_path)
+        self._bus = None
+        self._safety_task = asyncio.ensure_future(self._safety_resume())
+
+    async def _safety_resume(self) -> None:
+        await asyncio.sleep(self._SAFETY_TIMEOUT_S)
+        if self._paused:
+            log.warning("ADV safety timeout (%.0f s) — forcing resume", self._SAFETY_TIMEOUT_S)
+            await self.resume()
+
+    async def resume(self) -> None:
+        if not self._paused:
+            return
+        self._paused = False
+        if self._safety_task:
+            self._safety_task.cancel()
+            self._safety_task = None
+        log.info("ADV resume — restarting advertising after fragment reception")
+        try:
+            self._bus = await start_le_advertisement(
+                self._service_uuid, self._local_name, self._adapter_path
+            )
+        except Exception:
+            log.exception("ADV resume failed")
+
+    async def stop(self) -> None:
+        if self._safety_task:
+            self._safety_task.cancel()
+            self._safety_task = None
+        if self._bus:
+            await stop_le_advertisement(self._bus, self._adapter_path)
+            self._bus = None
 
 
 async def stop_le_advertisement(bus: "MessageBus", adapter_path: str = _ADAPTER_OBJ) -> None:

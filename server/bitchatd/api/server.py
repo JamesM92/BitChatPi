@@ -20,6 +20,9 @@ Daemon → all clients (pushed events):
   {"event": "peer",    "action": "seen"|"lost", "peer_id": "...", "nick": "...",
                         "last_seen": <unix_seconds>}
   {"event": "file",    "from": "...", "nick": "...", "path": "...", "mime": "...", "name": "..."}
+  {"event": "fragment_partial", "from": "...", "nick": "...", "received": <int>, "total": <int>,
+                                "missing": [<index>, ...], "attempt": <int>,
+                                "transfer_id": "<hex8>", "approx_kb": <int>}
 
 Each command receives an inline response:
   {"ok": true, "msg_id": "<uuid>"}          — send / broadcast / send_file

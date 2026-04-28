@@ -33,8 +33,10 @@ import asyncio
 import json
 import os
 import queue
+import re
 import sys
 import threading
+import time
 from collections import OrderedDict, defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -44,8 +46,66 @@ try:
 except ImportError:
     sys.exit("urwid not found — run:  .venv/bin/pip install urwid")
 
+# Img2ContourAscii color output uses ANSI 24-bit sequences: \033[38;2;R;G;Bm{ch}\033[0m
+# Convert them to urwid AttrSpec markup so urwid knows the true display width.
+_ANSI_COLOR_RE = re.compile(r'\033\[38;2;(\d+);(\d+);(\d+)m(.)\033\[0m')
+
+
+def _ansi_to_urwid(line: str) -> list:
+    """Parse an Img2ContourAscii colored line into a urwid markup list.
+
+    Merges consecutive same-color characters into single segments so urwid
+    processes O(color-changes) segments instead of O(characters) per row.
+    """
+    markup = []
+    pos = 0
+    cur_color: str | None = None
+    cur_text = ""
+
+    for m in _ANSI_COLOR_RE.finditer(line):
+        if m.start() > pos:
+            if cur_text:
+                markup.append((urwid.AttrSpec(f'#{cur_color}', 'default'), cur_text))
+                cur_text = ""
+                cur_color = None
+            markup.append(line[pos:m.start()])
+        r, g, b, ch = int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4)
+        color = f'{r:02x}{g:02x}{b:02x}'
+        if color == cur_color:
+            cur_text += ch
+        else:
+            if cur_text:
+                markup.append((urwid.AttrSpec(f'#{cur_color}', 'default'), cur_text))
+            cur_color = color
+            cur_text = ch
+        pos = m.end()
+
+    if cur_text:
+        markup.append((urwid.AttrSpec(f'#{cur_color}', 'default'), cur_text))
+    if pos < len(line):
+        markup.append(line[pos:])
+    return markup or [line]
+
+
 DEFAULT_SOCK = str(Path.home() / ".config" / "bitchatd" / "api.sock")
 GLOBAL_KEY = "__global__"
+
+
+def _fmt_ranges(indices: list[int]) -> str:
+    """Compact a sorted list of ints into hyphenated ranges: [1,2,3,7] → '1-3, 7'."""
+    if not indices:
+        return ""
+    indices = sorted(indices)
+    parts = []
+    start = end = indices[0]
+    for n in indices[1:]:
+        if n == end + 1:
+            end = n
+        else:
+            parts.append(str(start) if start == end else f"{start}-{end}")
+            start = end = n
+    parts.append(str(start) if start == end else f"{start}-{end}")
+    return ", ".join(parts)
 PEER_PANEL_W = 22  # peer panel width in columns
 
 PALETTE = [
@@ -159,6 +219,9 @@ class App:
         # _uuid_to_loc: msg_id → (peer_key, entry_idx) once assigned
         self._ack_pending: list[tuple[str, int]] = []
         self._uuid_to_loc: dict[str, tuple[str, int]] = {}
+        # sender_hex → (attempt, content_id, approx_kb, timestamp) — set by fragment_completed,
+        # consumed by the next file event from that sender (expires after 120 s)
+        self._pending_completions: dict[str, tuple[int, str, int, float]] = {}
 
         self._build_ui()
 
@@ -205,9 +268,12 @@ class App:
             focus_part="footer",
         )
 
+        screen = urwid.raw_display.Screen()
+        screen.set_terminal_properties(colors=2**24)
         self.loop = urwid.MainLoop(
             self.frame,
             PALETTE,
+            screen=screen,
             handle_mouse=True,
             unhandled_input=self._handle_key,
         )
@@ -235,6 +301,8 @@ class App:
                 self.peer_listbox.focus_position = min(old_pos, len(items) - 1)
             except IndexError:
                 pass
+        else:
+            self.peer_listbox.set_focus_pending = None
 
     def _on_peer_select(self, peer_id: str) -> None:
         self.active = peer_id
@@ -251,6 +319,10 @@ class App:
     def _rebuild_chat(self) -> None:
         items = [self._make_chat_row(e) for e in self.chats[self.active]]
         self.chat_walker[:] = items
+        if not items:
+            # urwid stores a set_focus_pending offset that becomes invalid when
+            # the walker is emptied; clear it to prevent IndexError on next render
+            self.chat_listbox.set_focus_pending = None
         self._scroll_chat_bottom()
 
     def _make_chat_row(self, entry: tuple) -> urwid.Widget:
@@ -259,6 +331,8 @@ class App:
         if text.startswith(_FILE_TAG):
             path = text[len(_FILE_TAG):]
             return FileButton(prefix, path, on_open=self._preview_file)
+        if '\033[' in text:
+            return urwid.Text([("divider", prefix)] + _ansi_to_urwid(text))
         return urwid.Text([("divider", prefix), (attr, text)])
 
     def _preview_file(self, path: str) -> None:
@@ -308,27 +382,35 @@ class App:
     def _render_image(self, key: str, path: str) -> None:
         """Render an image file as ASCII art lines into the chat."""
         try:
+            import numpy as np
             from PIL import Image
             from pathlib import Path as _Path
             import sys as _sys
             client_dir = str(_Path(__file__).resolve().parent)
             if client_dir not in _sys.path:
                 _sys.path.insert(0, client_dir)
-            from img2ascii import to_ascii
-            img = Image.open(path)
-            # Derive available width from the current terminal size.
-            # Layout: full_cols - peer_panel - 1 (divider) - prefix_chars
-            # prefix: "[HH:MM]    " = about 12 chars; leave a 2-char margin.
+            from img2ContourAscii import Renderer, CELL_ASPECT
             try:
-                cols, _ = self.loop.screen.get_cols_rows()
+                cols, rows = self.loop.screen.get_cols_rows()
             except Exception:
-                cols = 80
-            img_width = max(20, cols - PEER_PANEL_W - 1 - 14)
-            art = to_ascii(img, width=img_width, invert=False)
+                cols, rows = 80, 24
+            # chat area = cols - peer_panel(22) - divider(1)
+            # prefix "[HH:MM]    : " = 13 chars
+            img_width = max(20, cols - PEER_PANEL_W - 1 - 13)
+            # header(1) + title(1) + divider(1) + footer(1) + sys-msg row(1) = 5
+            max_img_rows = max(4, rows - 5)
+            img = Image.open(path).convert("RGB")
+            iw, ih = img.size
+            # Reduce cols if the image would exceed max_img_rows at full width
+            rows_at_full = max(1, round(ih * img_width / (iw * CELL_ASPECT)))
+            if rows_at_full > max_img_rows:
+                img_width = max(20, int(max_img_rows * iw * CELL_ASPECT / ih))
+            renderer = Renderer(cols=img_width, autocontrast=True, use_color=True)
+            art = renderer.render_frame(np.array(img, dtype=np.float32))
             for line in art.split("\n"):
                 self._add_msg(key, "   ", line, "chat_other")
         except Exception as exc:
-            self._add_sys(key, f"Image preview failed: {exc}")
+            self._add_sys(key, f"Img2ContourAscii preview failed: {exc}")
 
     # ── Input handling ────────────────────────────────────────────────────────
 
@@ -501,11 +583,78 @@ class App:
             is_new  = from_id and from_id not in self.peers
             if from_id:
                 self.peers[from_id] = nick
-            self._add_sys(target, f"File received: {name}  [{mime}]  saved: {path}")
+            completion = self._pending_completions.pop(from_id, None)
+            if completion and time.time() - completion[3] <= 120:
+                attempt, content_id, approx_kb, _ = completion
+                tag = f" [#{content_id}]" if content_id else ""
+                self._add_sys(target,
+                    f"File received: {name}  [{mime}]  saved: {path}"
+                    f"  — completes partial{tag} (attempt #{attempt})")
+            else:
+                self._add_sys(target, f"File received: {name}  [{mime}]  saved: {path}")
             # Clickable preview row only for images (audio/video can't be played in the TUI)
             if mime.startswith("image/"):
                 self._add_msg(target, nick, f"{_FILE_TAG}{path}", "chat_system")
             return bool(is_new) or target != self.active
+
+        if ev == "fragment_partial":
+            from_id          = obj.get("from", "")
+            nick             = obj.get("nick") or (from_id[:8] if from_id else "?")
+            received         = obj.get("received", 0)
+            total            = obj.get("total", 0)
+            missing          = obj.get("missing", [])
+            combined_received = obj.get("combined_received", received)
+            combined_missing  = obj.get("combined_missing", missing)
+            attempt          = obj.get("attempt", 1)
+            content_id       = obj.get("content_id", "")
+            approx_kb        = obj.get("approx_kb", 0)
+            target           = from_id if from_id else GLOBAL_KEY
+            if from_id and from_id not in self.peers:
+                self.peers[from_id] = nick
+            pct          = int(100 * received / total) if total else 0
+            combined_pct = int(100 * combined_received / total) if total else 0
+            name = f"~{approx_kb}KB image" if approx_kb else "image"
+            if content_id:
+                name += f" [#{content_id}]"
+            self._add_sys(target,
+                f"[PARTIAL IMAGE] Attempt #{attempt} — {name} — "
+                f"this attempt: {received}/{total} ({pct}%) missing=[{_fmt_ranges(missing)}]")
+            if attempt > 1:
+                self._add_sys(target,
+                    f"  combined across all attempts: {combined_received}/{total} "
+                    f"({combined_pct}%) missing=[{_fmt_ranges(combined_missing)}]")
+            if attempt == 1:
+                self._add_sys(target,
+                    "  Image incomplete — the sender has been notified automatically; "
+                    "it will appear if they resend.")
+            return target != self.active
+
+        if ev == "fragment_set_started":
+            from_id    = obj.get("from", "")
+            nick       = obj.get("nick") or (from_id[:8] if from_id else "?")
+            total      = obj.get("total", 0)
+            attempt    = obj.get("attempt", 2)
+            inherited  = obj.get("inherited", 0)
+            content_id = obj.get("content_id", "")
+            target     = from_id if from_id else GLOBAL_KEY
+            if from_id and from_id not in self.peers:
+                self.peers[from_id] = nick
+            missing = total - inherited
+            pct     = int(100 * inherited / total) if total else 0
+            cid_tag = f" [#{content_id}]" if content_id else ""
+            self._add_sys(target,
+                f"[RESUMING] Attempt #{attempt}{cid_tag} — "
+                f"already have {inherited}/{total} ({pct}%), need {missing} more")
+            return target != self.active
+
+        if ev == "fragment_completed":
+            from_id    = obj.get("from", "")
+            attempt    = obj.get("attempt", 2)
+            approx_kb  = obj.get("approx_kb", 0)
+            content_id = obj.get("content_id", "")
+            if from_id:
+                self._pending_completions[from_id] = (attempt, content_id, approx_kb, time.time())
+            return False
 
         # {"ok": true, "msg_id": "..."} — assign UUID to pending sent message
         if obj.get("ok") and "msg_id" in obj:

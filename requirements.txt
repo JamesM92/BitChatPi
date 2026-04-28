@@ -1,0 +1,5 @@
+# Server runtime dependencies (pinned — matches install-server.sh)
+bleak==3.0.1
+dbus-fast==4.0.4
+dissononce==0.34.3
+cryptography==47.0.0

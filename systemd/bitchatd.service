@@ -21,8 +21,8 @@ ExecStartPost=/bin/bash -c 'for i in $(seq 1 15); do [ -S /root/.config/bitchatd
 
 Restart=on-failure
 RestartSec=10
-StandardOutput=append:/tmp/bitchatd.log
-StandardError=append:/tmp/bitchatd.log
+StandardOutput=append:/root/.config/bitchatd/bitchatd.log
+StandardError=append:/root/.config/bitchatd/bitchatd.log
 Environment=PYTHONUNBUFFERED=1
 KillSignal=SIGTERM
 TimeoutStopSec=15

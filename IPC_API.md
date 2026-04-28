@@ -20,18 +20,32 @@ The socket path can be overridden at daemon startup; the running path is always 
 ## Connection lifecycle
 
 1. Connect to the socket.
-2. The daemon accepts multiple simultaneous clients.
+2. The daemon immediately sends a `hello` event with the node's own peer ID and nickname.
 3. Send JSON commands (one per line, terminated with `\n`).
 4. Read lines from the socket — these are either inline responses to a command you just sent, or pushed events that arrive at any time.
 5. There is no authentication or handshake. Disconnect by closing the socket.
 
-The daemon does **not** echo a welcome message on connect. Send `{"cmd":"peers"}` immediately after connecting if you want to know the current peer list.
+The daemon accepts multiple simultaneous clients. All pushed events are broadcast to every connected client.
 
 ---
 
 ## Commands (client → daemon)
 
 Every command is a JSON object with a `"cmd"` field. Send it as a single line followed by `\n`.
+
+### `ping` — health check
+
+```json
+{"cmd": "ping"}
+```
+
+**Inline response:**
+
+```json
+{"ok": true, "pong": true}
+```
+
+---
 
 ### `peers` — list known peers
 
@@ -46,13 +60,33 @@ Every command is a JSON object with a `"cmd"` field. Send it as a single line fo
   "ok": true,
   "event": "peers",
   "list": [
-    {"peer_id": "a1b2c3d4...", "nick": "Alice"},
-    {"peer_id": "e5f6a7b8...", "nick": "Bob"}
+    {"peer_id": "a1b2c3d4...", "nick": "Alice", "last_seen": 1714236000},
+    {"peer_id": "e5f6a7b8...", "nick": "Bob",   "last_seen": 1714235980}
   ]
 }
 ```
 
-`peer_id` is the sender's BLE identity as a lowercase hex string (32 hex chars = 16 bytes).
+| Field | Type | Description |
+|-------|------|-------------|
+| `peer_id` | string | Hex peer ID (32 hex chars = 16 bytes) |
+| `nick` | string | Peer's self-reported nickname |
+| `last_seen` | number | Unix timestamp of the last received ANNOUNCE from this peer |
+
+---
+
+### `set_nick` — change the node's nickname
+
+```json
+{"cmd": "set_nick", "nick": "MyNode"}
+```
+
+**Inline response:**
+
+```json
+{"ok": true, "nick": "MyNode"}
+```
+
+The new nickname is used in all subsequent ANNOUNCE packets broadcast over the mesh.
 
 ---
 
@@ -67,7 +101,7 @@ Every command is a JSON object with a `"cmd"` field. Send it as a single line fo
 | `to` | string | Hex peer ID of the recipient |
 | `content` | string | UTF-8 message text |
 
-**Inline response (success):**
+**Inline response:**
 
 ```json
 {"ok": true, "msg_id": "550e8400-e29b-41d4-a716-446655440000"}
@@ -75,13 +109,7 @@ Every command is a JSON object with a `"cmd"` field. Send it as a single line fo
 
 `msg_id` is a UUID string. Hold onto it — delivery and read receipts reference it in their `"ref"` field.
 
-**Inline response (no Noise session yet):**
-
-```json
-{"ok": true, "msg_id": "550e8400-..."}
-```
-
-The daemon still returns `ok: true` and queues the message internally. It simultaneously sends a BLE `ANNOUNCE` packet to prompt the recipient's device to initiate the Noise handshake. The message is delivered automatically once the session is established. There is currently no event to inform the client when queued messages are actually sent.
+If no Noise session exists yet, the daemon returns `ok: true`, queues the message internally, and sends a BLE `ANNOUNCE` to prompt the peer to initiate the handshake. The message is delivered automatically once the session is established.
 
 **Inline response (error):**
 
@@ -100,17 +128,14 @@ The daemon still returns `ok: true` and queues the message internally. It simult
 | Field | Type | Description |
 |-------|------|-------------|
 | `content` | string | UTF-8 message text |
-| `channel` | string | *(optional, currently unused)* |
 
 Broadcasts are sent as unencrypted `MESSAGE` packets and are visible to all mesh nodes. They do not generate receipts.
 
 **Inline response:**
 
 ```json
-{"ok": true}
+{"ok": true, "msg_id": "550e8400-..."}
 ```
-
-No `msg_id` is returned because there are no receipts for broadcasts.
 
 ---
 
@@ -139,19 +164,34 @@ The daemon reads the file, encrypts it, and sends it over the established Noise 
 {"ok": false, "error": "no established session — send a DM first"}
 ```
 
-Unlike `send`, file sends are not queued. The recipient must have already opened a DM to establish the Noise session before files can be sent.
+Unlike `send`, file sends are not queued. A Noise session must already be established before sending a file.
 
 **Inline response (file unreadable):**
 
 ```json
-{"ok": false, "error": "cannot read file: [Errno 2] No such file or directory: '/path/to/file.jpg'"}
+{"ok": false, "error": "cannot read file: [Errno 2] No such file or directory: '...'"}
 ```
 
 ---
 
 ## Events (daemon → client, pushed)
 
-The daemon pushes events to **all** connected clients whenever something happens on the BLE mesh. These arrive as unsolicited lines on the socket, interleaved with command responses. Read them in a separate coroutine or thread.
+The daemon pushes events to all connected clients whenever something happens on the BLE mesh. These arrive as unsolicited lines on the socket, interleaved with command responses. Read them in a separate coroutine or thread.
+
+### `hello` — node identity (sent on connect)
+
+```json
+{"event": "hello", "peer_id": "8d524fa0...", "nick": "BitChatPi"}
+```
+
+Sent immediately when a client connects. Contains the daemon's own peer ID and current nickname. Use this to distinguish messages the node sent itself from messages received from other peers.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `peer_id` | string | This node's hex peer ID |
+| `nick` | string | This node's current nickname |
+
+---
 
 ### `message` — a message was received
 
@@ -161,7 +201,10 @@ The daemon pushes events to **all** connected clients whenever something happens
   "from": "a1b2c3d4...",
   "nick": "Alice",
   "content": "Hello!",
-  "private": true
+  "private": true,
+  "self": false,
+  "ts": 1714236000,
+  "msg_id": "550e8400-..."
 }
 ```
 
@@ -171,18 +214,29 @@ The daemon pushes events to **all** connected clients whenever something happens
 | `nick` | string | Sender's self-reported nickname |
 | `content` | string | Message text |
 | `private` | boolean | `true` = DM (Noise-encrypted); `false` = public broadcast |
+| `self` | boolean | `true` if this echo is for a message sent by this node |
+| `ts` | number | Unix timestamp from the packet header |
+| `msg_id` | string | Message UUID (for receipt correlation) |
 
 ---
 
 ### `peer` — a peer appeared or disappeared
 
 ```json
-{"event": "peer", "action": "seen", "peer_id": "a1b2c3d4...", "nick": "Alice"}
+{"event": "peer", "action": "seen", "peer_id": "a1b2c3d4...", "nick": "Alice", "last_seen": 1714236000}
 {"event": "peer", "action": "lost", "peer_id": "a1b2c3d4...", "nick": "Alice"}
 ```
 
-`seen` fires when a new `ANNOUNCE` packet is received from a previously unknown peer.  
-`lost` is not currently emitted (the daemon has no timeout-based disconnect detection yet).
+`seen` fires when an `ANNOUNCE` is received from a previously unknown peer.
+
+`lost` fires when a `LEAVE` packet is received from a peer (e.g. the BitChat app backgrounded or the phone left the mesh). It does not fire on timeout — a peer that goes silent without sending `LEAVE` stays in the known-peers list until the daemon is restarted.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `action` | string | `"seen"` or `"lost"` |
+| `peer_id` | string | Hex peer ID |
+| `nick` | string | Peer's nickname |
+| `last_seen` | number | Unix timestamp of last ANNOUNCE *(present on `seen` only)* |
 
 ---
 
@@ -210,7 +264,7 @@ The Pi sends both receipt types immediately after decrypting a received message 
   "event": "file",
   "from": "a1b2c3d4...",
   "nick": "Alice",
-  "path": "/tmp/bitchat_550e8400.jpg",
+  "path": "/root/.config/bitchatd/files/bitchat_550e8400.jpg",
   "mime": "image/jpeg",
   "name": "photo.jpg"
 }
@@ -220,11 +274,106 @@ The Pi sends both receipt types immediately after decrypting a received message 
 |-------|------|-------------|
 | `from` | string | Hex peer ID of the sender |
 | `nick` | string | Sender's nickname |
-| `path` | string | Absolute path where the daemon saved the file on the Pi |
+| `path` | string | Absolute path where the daemon saved the file (`~/.config/bitchatd/files/`) |
 | `mime` | string | MIME type detected from file magic bytes |
-| `name` | string | Original filename from the file transfer packet (may be synthetic like `file.jpg` if not provided) |
+| `name` | string | Original filename (may be synthetic like `file.jpg` if not provided by sender) |
 
-Files are saved to `/tmp/bitchat_<8-char-id><ext>`. The daemon sends a delivery receipt to the sender automatically.
+The daemon saves the file to disk before emitting this event and sends a delivery+read receipt to the sender automatically.
+
+---
+
+### `fragment_partial` — a large file arrived incomplete
+
+Emitted when a fragmented transfer times out before all pieces arrive. The file was **not** saved — no `file` event will follow for this attempt. The daemon caches the received fragments for up to 60 minutes; if the sender retransmits, the new attempt inherits the cached pieces and may complete without needing to resend everything.
+
+After emitting this event the daemon automatically sends a DM reply to the sender describing what is missing (rate-limited to once per minute per peer).
+
+```json
+{
+  "event":             "fragment_partial",
+  "from":              "a1b2c3d4...",
+  "nick":              "Alice",
+  "received":          136,
+  "total":             137,
+  "missing":           [116],
+  "combined_received": 136,
+  "combined_missing":  [116],
+  "attempt":           1,
+  "transfer_id":       "c1b4ab17",
+  "content_id":        "abc123",
+  "approx_kb":         52
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `from` | string | Hex peer ID of the sender |
+| `nick` | string | Sender's nickname |
+| `received` | int | Fragments that arrived in this attempt |
+| `total` | int | Total fragments expected |
+| `missing` | array of int | Zero-based indices missing from this attempt |
+| `combined_received` | int | Fragments held across all attempts (this attempt + rescue cache) |
+| `combined_missing` | array of int | Indices still missing after combining all cached fragments |
+| `attempt` | int | Attempt number (1 = first send, 2 = first retry, …) |
+| `transfer_id` | string | First 8 hex chars of the fragment set ID |
+| `content_id` | string | Opaque content identifier set by the sender (may be empty) |
+| `approx_kb` | int | Estimated file size in KB |
+
+Retransmission by the sender is automatic but may take several minutes depending on the BitChat app's retry schedule.
+
+---
+
+### `fragment_set_started` — a retransmission began with rescued fragments
+
+Emitted when a new fragment set arrives and the daemon can seed it with cached fragments from a previous partial attempt. This signals that a retry is underway and already has a head start.
+
+```json
+{
+  "event":      "fragment_set_started",
+  "from":       "a1b2c3d4...",
+  "nick":       "Alice",
+  "total":      137,
+  "attempt":    2,
+  "inherited":  136,
+  "content_id": "abc123"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `from` | string | Hex peer ID of the sender |
+| `nick` | string | Sender's nickname |
+| `total` | int | Total fragments expected |
+| `attempt` | int | Attempt number for this set (≥ 2 when inherited fragments are present) |
+| `inherited` | int | Number of fragments pre-loaded from the rescue cache |
+| `content_id` | string | Opaque content identifier (may be empty) |
+
+---
+
+### `fragment_completed` — a multi-attempt transfer finished reassembly
+
+Emitted when a fragmented transfer that required at least two attempts finally reassembles successfully. Fired immediately before the `file` event for the same transfer so clients can correlate the completion with earlier `fragment_partial` events.
+
+```json
+{
+  "event":      "fragment_completed",
+  "from":       "a1b2c3d4...",
+  "nick":       "Alice",
+  "attempt":    2,
+  "total":      137,
+  "approx_kb":  52,
+  "content_id": "abc123"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `from` | string | Hex peer ID of the sender |
+| `nick` | string | Sender's nickname |
+| `attempt` | int | Attempt number on which reassembly succeeded |
+| `total` | int | Total fragment count |
+| `approx_kb` | int | Estimated file size in KB |
+| `content_id` | string | Opaque content identifier (may be empty) |
 
 ---
 
@@ -250,11 +399,11 @@ SOCK = "/root/.config/bitchatd/api.sock"
 async def main():
     reader, writer = await asyncio.open_unix_connection(SOCK)
 
-    # Ask for peer list
+    # hello arrives automatically on connect
+    # then ask for the current peer list
     writer.write(b'{"cmd":"peers"}\n')
     await writer.drain()
 
-    # Read events and responses forever
     while True:
         raw = await reader.readline()
         if not raw:
@@ -263,9 +412,12 @@ async def main():
         obj = json.loads(raw)
         ev = obj.get("event")
 
-        if ev == "peers":
+        if ev == "hello":
+            print(f"connected as {obj['nick']} ({obj['peer_id'][:8]}…)")
+
+        elif ev == "peers":
             for p in obj.get("list", []):
-                print(f"peer: {p['nick']} ({p['peer_id']})")
+                print(f"peer: {p['nick']} ({p['peer_id'][:8]}…)")
 
         elif ev == "message":
             src = "DM" if obj.get("private") else "broadcast"
@@ -296,6 +448,11 @@ asyncio.run(main())
 ```
 client                       daemon                        BLE mesh
   │                             │                              │
+  │  (connect)                  │                              │
+  │ ──────────────────────────► │                              │
+  │  {"event":"hello",…}        │                              │
+  │ ◄────────────────────────── │                              │
+  │                             │                              │
   │  {"cmd":"send","to":…}      │                              │
   │ ──────────────────────────► │                              │
   │                             │   NOISE_ENCRYPTED packet     │
@@ -303,23 +460,21 @@ client                       daemon                        BLE mesh
   │ ◄────────────────────────── │                              │
   │                             │   receipt from phone         │
   │  {"event":"receipt",        │ ◄────────────────────────── │
-  │   "type":"delivery",        │                              │
-  │   "ref":"X",…}              │                              │
+  │   "type":"delivery",…}      │                              │
   │ ◄────────────────────────── │                              │
-  │                             │                              │
   │  {"event":"receipt",        │                              │
-  │   "type":"read","ref":"X"}  │                              │
+  │   "type":"read",…}          │                              │
   │ ◄────────────────────────── │                              │
 ```
 
-If no Noise session exists when `send` is issued, the daemon queues the message and sends an `ANNOUNCE` over BLE to invite the peer to initiate the handshake. The flow then continues from "NOISE_ENCRYPTED packet" once the handshake completes. The client sees `ok: true` immediately either way.
+If no Noise session exists when `send` is issued, the daemon queues the message and sends an `ANNOUNCE` over BLE to invite the peer to initiate the handshake. The flow continues from "NOISE_ENCRYPTED packet" once the handshake completes. The client sees `ok: true` immediately either way.
 
 ---
 
 ## Notes for client authors
 
-- **Multiple clients are supported.** All pushed events go to every connected client simultaneously. A second monitoring client will see all traffic without interfering with the primary UI client.
-- **No session tracking in the API.** The daemon manages Noise sessions internally. Clients do not need to know whether a session exists; just send `send` and the daemon handles queuing or immediate delivery.
-- **`msg_id` format.** Always a standard UUID v4 string (`xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`). Receipts reference it verbatim in their `"ref"` field.
+- **Multiple clients are supported.** All pushed events go to every connected client simultaneously.
+- **No session tracking in the API.** The daemon manages Noise sessions internally. Just send `send` — the daemon handles queuing or immediate delivery.
+- **`msg_id` format.** Always a standard UUID v4 string. Receipts reference it verbatim in their `"ref"` field.
 - **Files are saved by the daemon.** When a `file` event arrives, the file is already on disk at `path`. The client only needs to display or open it.
-- **Peer IDs are stable.** They are derived from the node's Ed25519 identity keypair and persist across restarts (stored in `~/.config/bitchatd/identity.json`). You can use them as stable keys for per-peer state.
+- **Peer IDs are stable.** Derived from the node's Ed25519 keypair and persist across restarts (`~/.config/bitchatd/identity.json`). Safe to use as stable keys for per-peer state.

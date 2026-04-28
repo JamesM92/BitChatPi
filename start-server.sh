@@ -9,7 +9,7 @@
 set -e
 cd "$(dirname "$0")"
 
-LOG="${BITCHATD_LOG:-/tmp/bitchatd.log}"
+LOG="${BITCHATD_LOG:-/root/.config/bitchatd/bitchatd.log}"
 SOCK=/root/.config/bitchatd/api.sock
 RESET_BLE=0
 

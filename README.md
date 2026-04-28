@@ -10,11 +10,11 @@ A Raspberry Pi BLE mesh node for the [Nodebot](https://github.com/JamesM92/Nodeb
 
 [Nodebot](https://github.com/JamesM92/Nodebot) relies on a reliable always-on mesh node that bridges between online and offline network segments. BitChatPi fills that role: it runs the [BitChat](https://github.com/permadao/BitChat) BLE mesh protocol on a Raspberry Pi, keeping a persistent node alive on the local mesh so Nodebot can route messages through it.
 
-This is a spin-off of the original BitChat Android project. The Pi acts as a **peripheral-only GATT server** — it advertises, accepts connections, performs the Noise XX handshake, and relays mesh traffic, but it does not scan or initiate connections.
+The Pi operates as a **symmetric BLE mesh node** — it simultaneously acts as a GATT peripheral (advertising and accepting connections from phones) and a BLE central (scanning for and connecting to other BitChat peers). It performs the Noise XX handshake with each peer, relays mesh traffic, and exposes a local IPC socket for other processes to send and receive messages.
 
 ### The TUI client
 
-The `client/` directory contains a terminal UI (`tui.py`) built with urwid. It is a **development/testing tool only** — useful for verifying that the daemon is working, sending test messages, and inspecting peer connections. It is not intended for regular use and may be unstable.
+The `client/` directory contains a terminal UI (`tui.py`) built with urwid. It is a **reference implementation** — useful for verifying the daemon is working, sending test messages, and previewing received images. It is not polished software.
 
 ---
 
@@ -27,7 +27,7 @@ The `client/` directory contains a terminal UI (`tui.py`) built with urwid. It i
 
 ---
 
-## Installation on a fresh Raspberry Pi OS Lite
+## Installation
 
 ### 1. System packages
 
@@ -40,10 +40,11 @@ sudo apt install -y \
     libdbus-1-dev \
     libglib2.0-dev \
     libcairo2-dev \
-    gcc
+    gcc \
+    socat
 ```
 
-### 2. Enable and start Bluetooth
+### 2. Enable Bluetooth
 
 ```bash
 sudo systemctl enable bluetooth
@@ -56,11 +57,7 @@ Verify the adapter is visible:
 bluetoothctl show
 ```
 
-You should see `Powered: yes`. If not:
-
-```bash
-bluetoothctl power on
-```
+You should see `Powered: yes`. If not: `bluetoothctl power on`
 
 ### 3. Clone the repo
 
@@ -69,95 +66,79 @@ git clone https://github.com/JamesM92/BitChatPi.git
 cd BitChatPi
 ```
 
-### 4. Create the Python virtual environment
+### 4. Install the server
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install --upgrade pip
+sudo ./install-server.sh
 ```
 
-### 5. Install Python dependencies
+This creates a Python venv at `/opt/bitchatpi/.venv`, installs all dependencies with pinned versions, copies the server files, registers and starts the `bitchatd` systemd service, and enables it on boot.
+
+### 5. (Optional) Install the TUI client
 
 ```bash
-.venv/bin/pip install \
-    dbus-fast \
-    cryptography \
-    dissononce \
-    urwid \
-    pillow
+sudo ./install-client.sh
 ```
 
-### 6. Run
-
-The daemon must run as root because it needs direct D-Bus access to BlueZ:
-
-```bash
-sudo ./start.sh
-```
-
-This will:
-1. Kill any existing daemon instance
-2. Restart the Bluetooth service to clear stale BLE state
-3. Start the daemon (logging to `/tmp/bitchatd.log`)
-4. Launch the TUI client
-
-To watch the daemon log in a second terminal:
-
-```bash
-tail -f /tmp/bitchatd.log
-```
+Installs the TUI and its extra dependencies (`urwid`, `pillow`, `numpy`, `scipy`) into the same venv. Requires the server to be installed first.
 
 ---
 
-## Running as a background service (headless)
+## Running
 
-To run the daemon without the TUI, start it directly:
-
-```bash
-sudo .venv/bin/python3 server/daemon.py >> /tmp/bitchatd.log 2>&1 &
-```
-
-A systemd service unit can be written for auto-start on boot. See the `systemd/` directory if present, or use the following template:
-
-```ini
-[Unit]
-Description=BitChatPi BLE mesh daemon
-After=bluetooth.target
-
-[Service]
-Type=simple
-ExecStartPre=/bin/systemctl restart bluetooth
-ExecStartPre=/bin/sleep 3
-ExecStart=/home/pi/BitChatPi/.venv/bin/python3 /home/pi/BitChatPi/server/daemon.py
-Restart=on-failure
-RestartSec=10
-StandardOutput=append:/tmp/bitchatd.log
-StandardError=append:/tmp/bitchatd.log
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Adjust paths to match your install location, then:
+The daemon starts automatically on boot via systemd after installation. To manage it:
 
 ```bash
-sudo cp bitchatd.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now bitchatd
+sudo systemctl start bitchatd
+sudo systemctl stop bitchatd
+sudo systemctl status bitchatd
+```
+
+To restart and wait for the socket to come back up:
+
+```bash
+sudo ./restart-service.sh
+```
+
+To watch the live log:
+
+```bash
+# systemd journal
+journalctl -u bitchatd -f
+
+# or directly from the log file
+tail -f /root/.config/bitchatd/bitchatd.log
+```
+
+### TUI client
+
+```bash
+/opt/bitchatpi/start-client.sh
+```
+
+No root required — the IPC socket is world-writable.
+
+### Foreground / dev mode
+
+To run the daemon interactively (stops the service, restarts it on exit):
+
+```bash
+sudo ./start-server.sh
 ```
 
 ---
 
 ## Configuration
 
-| Item | Default | Location |
-|------|---------|----------|
-| Node nickname | `BitChatPi` | `server/daemon.py` — `NICKNAME` constant |
-| Identity (key pair) | auto-generated on first run | `/root/.config/bitchatd/identity.json` |
-| IPC socket | `/root/.config/bitchatd/api.sock` | `server/daemon.py` — `IPC_SOCK_PATH` |
-| Daemon log | `/tmp/bitchatd.log` | `BITCHATD_LOG` environment variable or `start.sh` |
+| Item | Default | How to change |
+|------|---------|--------------|
+| Node nickname | `BitChatPi` | `--nick NAME` flag, e.g. edit `ExecStart` in the service unit |
+| Identity (keypair) | auto-generated on first run | delete `/root/.config/bitchatd/identity.json` to regenerate |
+| IPC socket | `/root/.config/bitchatd/api.sock` | `--sock PATH` flag |
+| Received files | `/root/.config/bitchatd/files/` | hardcoded in `session_manager.py` |
+| Log file | `/root/.config/bitchatd/bitchatd.log` | edit `StandardOutput` in the service unit |
 
-The identity file persists the node's peer ID and Noise/signing keypairs across restarts. Delete it to generate a fresh identity.
+The identity file stores the node's peer ID and Noise/Ed25519 keypairs. It persists across restarts. Deleting it generates a new identity (new peer ID).
 
 ---
 
@@ -165,23 +146,50 @@ The identity file persists the node's peer ID and Noise/signing keypairs across 
 
 ```
 server/
-  daemon.py               — main process
+  daemon.py               — main process: BLE I/O, packet routing, process lifecycle
   bitchatd/
-    protocol/             — BitChat wire format (packet encode/decode, ANNOUNCE, FRAGMENT)
-    crypto/               — Noise XX session (dissononce), signing (Ed25519)
-    ble/                  — BlueZ D-Bus GATT server + LE advertiser (dbus-fast)
-    mesh/                 — relay / TTL engine
-    api/                  — Unix socket IPC server
+    protocol/             — BitChat wire format (packet codec, ANNOUNCE, FRAGMENT)
+    crypto/               — Noise XX session (dissononce), Ed25519 signing (cryptography)
+    ble/                  — BlueZ D-Bus GATT server + LE advertiser + BLE central scanner
+    mesh/                 — fragment reassembly, relay/TTL engine, Noise session management
+    api/                  — Unix socket IPC server (newline-delimited JSON)
 
 client/
-  tui.py                  — urwid TUI (testing only)
+  tui.py                  — urwid TUI (reference implementation)
   ipc_client.py           — minimal CLI IPC client
+  img2ContourAscii.py     — KD-tree ASCII art renderer (Img2ContourAscii)
+
+tests/                    — pytest suite (codec, crypto, relay, fragments)
 
 upstream/
   android/                — reference snapshots of the BitChat Android source
 ```
 
 The daemon speaks the BitChat protocol wire format directly and is compatible with the BitChat Android app.
+
+---
+
+## Fragment transfers and auto-reply
+
+Large files (images, etc.) are split into fragments by the sender. If a transfer times out before all fragments arrive, the daemon:
+
+1. Emits a `fragment_partial` IPC event with the missing fragment indices.
+2. Sends an automatic DM reply to the sender: `[auto] Transfer incomplete (attempt #N, X/Y fragments, ~ZKB, missing=[…]). Please try again.` — rate-limited to once per minute per peer.
+3. Caches the received fragments for up to 60 minutes. If the sender retransmits, the new attempt inherits the cached pieces (potentially completing with just the missing fragments).
+
+When reassembly eventually succeeds, a `fragment_completed` event is emitted before the `file` event.
+
+---
+
+## IPC API
+
+Any process on the Pi can connect to the IPC socket and send/receive messages over the mesh. See [IPC_API.md](IPC_API.md) for the full protocol reference.
+
+Quick example — broadcast a message:
+
+```bash
+echo '{"cmd":"broadcast","content":"hello mesh"}' | socat - UNIX-CONNECT:/root/.config/bitchatd/api.sock
+```
 
 ---
 
@@ -193,4 +201,4 @@ The BitChat Android app is the authoritative source for the wire protocol. Refer
 
 ## Licence
 
-This project inherits the licence of the original BitChat project. See the upstream repository for details.
+MIT. See [LICENSE](LICENSE). The BitChat protocol originates from the [BitChat upstream project](https://github.com/permadao/BitChat).

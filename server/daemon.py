@@ -37,8 +37,9 @@ from bitchatd.protocol.codec import encode, decode
 from bitchatd.crypto.identity import load_or_create
 from bitchatd.ble.gatt_server import GattServer
 from bitchatd.ble.scanner import BleScanner
-from bitchatd.ble.advertise import start_le_advertisement, stop_le_advertisement
+from bitchatd.ble.advertise import AdvertiseManager
 from bitchatd.api import IpcServer
+from bitchatd import __version__ as VERSION
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,8 +49,9 @@ logging.basicConfig(
 logging.getLogger("dissononce").setLevel(logging.WARNING)
 log = logging.getLogger("smoke")
 
-IDENTITY_PATH    = Path.home() / ".config" / "bitchatd" / "identity.json"
-DEFAULT_SOCK_PATH = str(Path.home() / ".config" / "bitchatd" / "api.sock")
+IDENTITY_PATH      = Path.home() / ".config" / "bitchatd" / "identity.json"
+RESCUE_CACHE_PATH  = Path.home() / ".config" / "bitchatd" / "rescue_cache.json"
+DEFAULT_SOCK_PATH  = str(Path.home() / ".config" / "bitchatd" / "api.sock")
 
 _gatt:        GattServer    | None = None
 _scanner:     BleScanner    | None = None
@@ -57,7 +59,10 @@ _ipc:         IpcServer     | None = None
 _relay:       RelayEngine   | None = None
 _fragments:   FragmentManager | None = None
 _session_mgr: SessionManager  | None = None
+_adv_mgr:     AdvertiseManager | None = None
 _identity     = None  # set in run()
+
+_last_write_time: float = 0.0  # updated each time _on_ble_write fires
 
 # Dedup cache: packets arrive via both the peripheral (WriteValue) and central
 # (scanner notification) BLE paths simultaneously.  Without this, every packet
@@ -117,6 +122,13 @@ def _send_packet(pkt: BitchatPacket) -> None:
     # receive Pi's ANNOUNCEs and how session handshakes complete.  Suppressing this
     # path was preventing newly-connecting phones from receiving Pi's ANNOUNCE,
     # which meant they never added Pi to their peer list.
+    if not _gatt.notifying and pkt.type in (
+        MessageType.NOISE_HANDSHAKE, MessageType.NOISE_ENCRYPTED, MessageType.MESSAGE
+    ):
+        log.warning("SENT type=0x%02x — no subscribers; notification not delivered. "
+                    "Phone has not subscribed to GATT notifications. "
+                    "Force-quit and reopen the BitChat app to reconnect.",
+                    pkt.type)
     _gatt.send(raw)
 
     # Suppress scanner (central-role) sends during fragment reassembly.  The central
@@ -193,11 +205,15 @@ def _dispatch(pkt: BitchatPacket) -> None:
                 # eliminates the conflict; scanner reconnects after the transfer.
                 if _scanner and _tot >= 20 and _fragments.is_new_set(_fid):
                     _scanner.disconnect_all_central()
+                    if _adv_mgr:
+                        asyncio.ensure_future(_adv_mgr.pause())
             reassembled = _fragments.handle_fragment(pkt)
             if reassembled is not None:
                 log.info("FRAGMENT reassembled from %s  original_type=0x%02x  %d bytes",
                          peer_hex, reassembled.type, len(reassembled.payload))
                 _dispatch(reassembled)
+                if _adv_mgr and not _fragments.is_receiving():
+                    asyncio.ensure_future(_adv_mgr.resume())
         # Don't relay fragments addressed to us — relaying our own DM fragments
         # causes RF contention with the sender's next write, dropping packets.
         addressed_to_us = (
@@ -244,6 +260,8 @@ def _dispatch(pkt: BitchatPacket) -> None:
 
 
 def _on_ble_write(data: bytes, device_path: str | None = None) -> None:
+    global _last_write_time
+    _last_write_time = time.time()
     log.debug("WRITE  %d raw bytes  device=%s", len(data), device_path)
     pkt = decode(data)
     if pkt is None:
@@ -319,19 +337,114 @@ async def _ensure_adapter_up() -> None:
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 async def run(nickname: str, sock_path: str = DEFAULT_SOCK_PATH) -> None:
-    global _gatt, _scanner, _ipc, _relay, _fragments, _session_mgr, _identity
+    global _gatt, _scanner, _ipc, _relay, _fragments, _session_mgr, _adv_mgr, _identity
 
     await _ensure_adapter_up()
 
     _identity = load_or_create(IDENTITY_PATH)
-    log.info("peer_id=%s  nick=%s", _identity.peer_id.hex(), nickname)
+    log.info("BitChatPi v%s  peer_id=%s  nick=%s", VERSION, _identity.peer_id.hex(), nickname)
 
     _relay = RelayEngine(_identity.peer_id)
     _relay.broadcast_packet = _relay_broadcast
     _relay.get_network_size = lambda: max(1, len(_session_mgr.peers) if _session_mgr else 1)
 
-    _fragments = FragmentManager()
+    _fragments = FragmentManager(rescue_cache_path=str(RESCUE_CACHE_PATH))
     _fragments.start()
+
+    # Per-sender cooldown: only send one auto-reply per minute to avoid spam
+    # on rapid retransmission attempts.
+    _auto_reply_last_sent: dict[str, float] = {}
+
+    def _on_fragment_expired(sender_hex: str, total: int,
+                             received: int, missing: list,
+                             combined_received: int, combined_missing: list,
+                             frag_id: str, attempt: int,
+                             original_type: int = 0,
+                             content_id: str = "") -> None:
+        nick = (_session_mgr.peers.get(sender_hex, "") if _session_mgr else "")
+        approx_kb = round(total * 451 / 1024)
+        _publish({
+            "event":             "fragment_partial",
+            "from":              sender_hex,
+            "nick":              nick or sender_hex[:8],
+            "received":          received,
+            "total":             total,
+            "missing":           missing,
+            "combined_received": combined_received,
+            "combined_missing":  combined_missing,
+            "attempt":           attempt,
+            "transfer_id":       frag_id[:8],
+            "content_id":        content_id,
+            "approx_kb":         approx_kb,
+        })
+        if original_type in (MessageType.FILE_TRANSFER, MessageType.NOISE_ENCRYPTED) and sender_hex and _session_mgr:
+            _now = time.time()
+            if _now - _auto_reply_last_sent.get(sender_hex, 0) >= 60:
+                _auto_reply_last_sent[sender_hex] = _now
+                def _fmt_ranges(indices: list) -> str:
+                    if not indices:
+                        return ""
+                    indices = sorted(indices)
+                    parts, start, end = [], indices[0], indices[0]
+                    for n in indices[1:]:
+                        if n == end + 1:
+                            end = n
+                        else:
+                            parts.append(str(start) if start == end else f"{start}-{end}")
+                            start = end = n
+                    parts.append(str(start) if start == end else f"{start}-{end}")
+                    return ", ".join(parts)
+                size_note = f"~{approx_kb}KB" if approx_kb else "unknown size"
+                reply = (
+                    f"[auto] Transfer incomplete (attempt #{attempt}, "
+                    f"{received}/{total} fragments, {size_note}, "
+                    f"missing=[{_fmt_ranges(missing)}]). "
+                    f"Please try again."
+                )
+                asyncio.ensure_future(
+                    _session_mgr.handle_command({"cmd": "send", "to": sender_hex, "content": reply})
+                )
+        if _adv_mgr and not _fragments.is_receiving():
+            asyncio.ensure_future(_adv_mgr.resume())
+
+    _fragments.on_fragment_expired = _on_fragment_expired
+
+    def _on_fragment_completed(sender_hex: str, attempt: int, total: int,
+                               original_type: int, frag_id: str,
+                               content_id: str = "") -> None:
+        nick = (_session_mgr.peers.get(sender_hex, "") if _session_mgr else "")
+        approx_kb = round(total * 451 / 1024)
+        _publish({
+            "event":      "fragment_completed",
+            "from":       sender_hex,
+            "nick":       nick or sender_hex[:8],
+            "attempt":    attempt,
+            "total":      total,
+            "approx_kb":  approx_kb,
+            "content_id": content_id,
+        })
+        if _session_mgr:
+            n = _session_mgr.cancel_pending_sends(sender_hex)
+            if n:
+                log.info("Cancelled %d queued auto-reply(s) for %s — image completed", n, sender_hex[:8])
+
+    _fragments.on_fragment_completed = _on_fragment_completed
+
+    def _on_fragment_set_started(sender_hex: str, total: int, original_type: int,
+                                  attempt: int, inherited_count: int,
+                                  frag_id: str, content_id: str) -> None:
+        nick = (_session_mgr.peers.get(sender_hex, "") if _session_mgr else "")
+        _publish({
+            "event":      "fragment_set_started",
+            "from":       sender_hex,
+            "nick":       nick or sender_hex[:8],
+            "total":      total,
+            "attempt":    attempt,
+            "inherited":  inherited_count,
+            "content_id": content_id,
+        })
+
+    _fragments.on_fragment_set_started = _on_fragment_set_started
 
     _session_mgr = SessionManager(
         identity=_identity,
@@ -341,12 +454,27 @@ async def run(nickname: str, sock_path: str = DEFAULT_SOCK_PATH) -> None:
         publish=_publish,
     )
 
+    _first_notify_done = False
+
     def _on_notify_subscribed() -> None:
+        nonlocal _first_notify_done
+        send_leave = not _first_notify_done
+        _first_notify_done = True
+
         async def _do_announce() -> None:
             if _session_mgr:
                 _session_mgr.clear_announce_cooldown()
+                if send_leave:
+                    # Only on first subscription after startup: send LEAVE so the
+                    # phone drops any stale Noise session it may have cached from a
+                    # previous daemon run where the Noise keypair was different.
+                    # Subsequent reconnects (e.g. during large fragment transfers)
+                    # must NOT send LEAVE — that would kill the active session.
+                    _send_packet(_session_mgr.make_leave())
+                    log.info("StartNotify (first) — sent LEAVE+ANNOUNCE")
+                else:
+                    log.info("StartNotify (reconnect) — sent ANNOUNCE only")
                 _send_packet(_session_mgr.make_announce())
-                log.info("StartNotify triggered — sent ANNOUNCE to new subscriber")
         asyncio.ensure_future(_do_announce())
 
     def _on_peer_disconnected(address: str) -> None:
@@ -373,7 +501,8 @@ async def run(nickname: str, sock_path: str = DEFAULT_SOCK_PATH) -> None:
     })
     await _ipc.start()
 
-    adv_bus = await start_le_advertisement(SERVICE_UUID, nickname)
+    _adv_mgr = AdvertiseManager(SERVICE_UUID, nickname)
+    await _adv_mgr.start()
     log.info("Advertising as '%s'  service=%s", nickname, SERVICE_UUID)
     log.info("Running — press Ctrl-C to stop.")
 
@@ -384,14 +513,40 @@ async def run(nickname: str, sock_path: str = DEFAULT_SOCK_PATH) -> None:
                 _send_packet(_session_mgr.make_announce())
                 log.debug("Periodic ANNOUNCE broadcast")
 
+    async def _subscription_watchdog() -> None:
+        """Disconnect devices that are writing but haven't subscribed to GATT notifications.
+
+        After a daemon restart, iOS caches the CCCD subscription state and does not
+        re-write it to the peripheral.  BlueZ therefore never fires StartNotify on the
+        new GATT application, so notify() is a no-op and the Noise handshake loops
+        forever.  Disconnecting forces the phone to reconnect and re-subscribe.
+        """
+        await asyncio.sleep(45)  # grace period: allow phones time to subscribe normally
+        while True:
+            await asyncio.sleep(20)
+            if _gatt is None or _gatt.notifying:
+                continue
+            if _fragments and _fragments.is_receiving():
+                # A fragment set is in progress — the phone temporarily unsubscribed
+                # while sending a large image.  Don't disconnect; it will reconnect
+                # and retransmit, letting the rescue-cache complete the set.
+                continue
+            if time.time() - _last_write_time < 30:
+                # Active writes but no subscription — stale CCCD cache
+                log.warning("Writes received but no GATT subscribers — "
+                            "disconnecting devices to force re-subscription")
+                await _gatt.disconnect_all_connected()
+
     asyncio.ensure_future(_periodic_announce())
+    asyncio.ensure_future(_subscription_watchdog())
 
     try:
         while True:
             await asyncio.sleep(3600)
     finally:
         try:
-            await stop_le_advertisement(adv_bus)
+            if _adv_mgr:
+                await _adv_mgr.stop()
         except Exception:
             pass
         if _scanner:
@@ -409,6 +564,7 @@ if __name__ == "__main__":
     import signal
 
     parser = argparse.ArgumentParser(description="BitChatPi mesh daemon")
+    parser.add_argument("--version", action="version", version=f"BitChatPi {VERSION}")
     parser.add_argument(
         "--nick", default="BitChatPi", metavar="NAME",
         help="Nickname to broadcast on the mesh (default: %(default)s)",

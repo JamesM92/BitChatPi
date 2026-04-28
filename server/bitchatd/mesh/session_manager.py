@@ -112,10 +112,14 @@ def _sniff_file(data: bytes) -> tuple[str, str]:
     return ".bin", "application/octet-stream"
 
 
+_FILES_DIR = Path.home() / ".config" / "bitchatd" / "files"
+
+
 def _save_received_file(msg_id: str, data: bytes) -> tuple[str, str]:
-    """Save binary data to /tmp/, return (path, mime)."""
+    """Save binary data to ~/.config/bitchatd/files/, return (path, mime)."""
+    _FILES_DIR.mkdir(parents=True, exist_ok=True)
     ext, mime = _sniff_file(data)
-    path = f"/tmp/bitchat_{msg_id[:8]}{ext}"
+    path = str(_FILES_DIR / f"bitchat_{msg_id[:8]}{ext}")
     with open(path, "wb") as fh:
         fh.write(data)
     return path, mime
@@ -307,6 +311,7 @@ class SessionManager:
         self._pending_msg2:       dict[str, bytes]                     = {}
         self._pending_sends:      dict[str, list[tuple[str, str, float]]] = {}
         self._session_timestamps: dict[str, float]                     = {}
+        self._decrypt_fail_count: dict[str, int]                       = {}
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -525,6 +530,11 @@ class SessionManager:
         ))
         log.info("Noise msg2 sent to %s  %d bytes", peer_hex, len(outgoing))
 
+    def cancel_pending_sends(self, to_hex: str) -> int:
+        """Remove all queued outbound messages for to_hex. Returns count cancelled."""
+        cancelled = self._pending_sends.pop(to_hex, [])
+        return len(cancelled)
+
     def _drain_pending_sends(self, peer_hex: str, sess: NoiseSession) -> None:
         queued = self._pending_sends.pop(peer_hex, [])
         now    = time.time()
@@ -567,8 +577,25 @@ class SessionManager:
 
         plaintext = sess.decrypt(pkt.payload)
         if plaintext is None:
-            log.warning("Decrypt failed from %s", peer_hex)
+            n = self._decrypt_fail_count.get(peer_hex, 0) + 1
+            self._decrypt_fail_count[peer_hex] = n
+            log.warning("Decrypt failed from %s (consecutive=%d)", peer_hex, n)
+            if n >= 3:
+                # Cipher state is permanently desynchronised — reset and force a
+                # fresh handshake so subsequent messages (including auto-replies)
+                # can be encrypted/decrypted correctly.
+                self._decrypt_fail_count.pop(peer_hex, None)
+                self._send_packet(self.make_leave())
+                self._sessions[peer_hex] = NoiseSession.create_responder(
+                    self._identity.noise_keypair)
+                self._last_announced.pop(peer_hex, None)
+                self._send_packet(self.make_announce())
+                self._last_announced[peer_hex] = time.time()
+                log.warning("Decrypt failed 3x from %s — reset session, sent LEAVE+ANNOUNCE",
+                            peer_hex)
             return
+
+        self._decrypt_fail_count.pop(peer_hex, None)  # reset on successful decrypt
 
         parsed = _parse_incoming(plaintext)
         if parsed is None:
